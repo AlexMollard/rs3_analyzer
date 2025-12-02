@@ -22,7 +22,7 @@ A desktop application for analyzing RuneScape 3 Grand Exchange market data to id
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/rs3_analyzer.git
+git clone https://github.com/AlexMollard/rs3_analyzer.git
 cd rs3_analyzer
 ```
 
