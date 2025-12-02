@@ -1,9 +1,10 @@
-use crate::{loader::load_snapshots, stats::build_stats, flips::analyze};
+use crate::{loader::{load_snapshots, load_item_history}, stats::build_stats, flips::analyze};
 use eframe::egui;
 use egui::{
     Color32, Context, FontFamily, FontId, Margin, RichText, Visuals, Stroke, Vec2
 };
 use egui_extras::{Column, TableBuilder};
+use egui_plot::{Line, Plot, PlotPoints};
 use std::collections::HashMap;
 
 pub fn set_custom_style(ctx: &Context) {
@@ -113,8 +114,11 @@ pub struct RS3App {
     // UI state
     selected_row: Option<usize>,
     
-    // Favorites
     favorites: HashMap<String, bool>,
+    
+    selected_item_history: Vec<(String, f64)>,
+    graph_height: f32,
+    target_graph_height: f32,
 }
 
 impl RS3App {
@@ -139,6 +143,10 @@ impl RS3App {
             selected_row: None,
             
             favorites,
+            
+            selected_item_history: vec![],
+            graph_height: 0.0,
+            target_graph_height: 0.0,
         }
     }
     
@@ -669,7 +677,6 @@ impl eframe::App for RS3App {
                             }
                         });
 
-                        // Item name
                         row.col(|ui| {
                             let mut text = RichText::new(&r.name);
                             if is_selected {
@@ -678,7 +685,20 @@ impl eframe::App for RS3App {
                                 text = text.color(Color32::from_rgb(255, 200, 100));
                             }
                             if ui.selectable_label(is_selected, text).clicked() {
-                                self.selected_row = if is_selected { None } else { Some(i) };
+                                if is_selected {
+                                    self.selected_row = None;
+                                    self.target_graph_height = 0.0;
+                                } else {
+                                    let old_selection = self.selected_row;
+                                    self.selected_row = Some(i);
+                                    self.target_graph_height = 300.0;
+                                    if old_selection != Some(i) {
+                                        self.selected_item_history.clear();
+                                        if let Ok(history) = load_item_history("rs3_market.db", &r.name) {
+                                            self.selected_item_history = history;
+                                        }
+                                    }
+                                }
                             }
                         });
 
@@ -845,37 +865,103 @@ impl eframe::App for RS3App {
             if !toggles.is_empty() {
                 self.save_favorites();
             }
-
-            if let Some(idx) = self.selected_row {
-                if let Some(r) = self.filtered_items.get(idx) {
-                    ui.add_space(10.0);
-                    ui.separator();
-                    
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(35, 28, 18))
-                        .stroke(Stroke::new(2.0, Color32::from_rgb(100, 80, 50)))
-                        .inner_margin(Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("⎘ Item Details:")
-                                    .color(Color32::from_rgb(255, 210, 100))
-                                    .strong()
-                                    .size(16.0));
-                                
-                                ui.label(RichText::new(&r.name)
-                                    .color(Color32::from_rgb(255, 220, 150))
-                                    .size(16.0));
-                                
-                                ui.separator();
-                                
-                                ui.label(RichText::new(&r.notes)
-                                    .color(Color32::from_rgb(180, 160, 120))
-                                    .italics());
-                            });
-                        });
-                }
-            }
         });
+
+        self.graph_height += (self.target_graph_height - self.graph_height) * 0.2;
+        if (self.target_graph_height - self.graph_height).abs() < 0.5 {
+            self.graph_height = self.target_graph_height;
+        }
+
+        if self.graph_height > 1.0 {
+            egui::TopBottomPanel::bottom("graph_panel")
+                .min_height(self.graph_height)
+                .max_height(self.graph_height)
+                .show(ctx, |ui| {
+                    if let Some(idx) = self.selected_row {
+                        if let Some(r) = self.filtered_items.get(idx) {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(35, 28, 18))
+                                .stroke(Stroke::new(2.0, Color32::from_rgb(100, 80, 50)))
+                                .inner_margin(Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("⎘ Price History:")
+                                            .color(Color32::from_rgb(255, 210, 100))
+                                            .strong()
+                                            .size(16.0));
+                                        
+                                        ui.label(RichText::new(&r.name)
+                                            .color(Color32::from_rgb(255, 220, 150))
+                                            .size(16.0));
+                                        
+                                        ui.separator();
+                                        
+                                        ui.label(RichText::new(&r.notes)
+                                            .color(Color32::from_rgb(180, 160, 120))
+                                            .italics());
+
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.button(RichText::new("✖").size(16.0)).clicked() {
+                                                self.selected_row = None;
+                                                self.target_graph_height = 0.0;
+                                                self.selected_item_history.clear();
+                                            }
+                                        });
+                                    });
+                                    
+                                    if !self.selected_item_history.is_empty() {
+                                        ui.add_space(5.0);
+                                        
+                                        let points: PlotPoints = self.selected_item_history
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, (_, price))| [i as f64, *price])
+                                            .collect();
+                                        
+                                        let line = Line::new("Price", points)
+                                            .color(Color32::from_rgb(100, 200, 255))
+                                            .width(2.0);
+                                        
+                                        let history_clone = self.selected_item_history.clone();
+                                        Plot::new("price_history")
+                                            .height(self.graph_height - 80.0)
+                                            .show_axes(true)
+                                            .show_grid(true)
+                                            .x_axis_formatter(move |mark, _range| {
+                                                let idx = mark.value as usize;
+                                                if let Some((date, _)) = history_clone.get(idx) {
+                                                    if date.len() >= 10 {
+                                                        date[5..10].to_string()
+                                                    } else {
+                                                        date.clone()
+                                                    }
+                                                } else {
+                                                    String::new()
+                                                }
+                                            })
+                                            .label_formatter(|_name, value| {
+                                                if let Some((date, _)) = self.selected_item_history.get(value.x as usize) {
+                                                    format!("{}\nPrice: {}", date, format_gp(value.y))
+                                                } else {
+                                                    format!("Price: {}", format_gp(value.y))
+                                                }
+                                            })
+                                            .show(ui, |plot_ui| {
+                                                plot_ui.line(line);
+                                            });
+                                    } else {
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label(RichText::new("Loading price history...")
+                                                .color(Color32::from_rgb(180, 160, 120))
+                                                .italics()
+                                                .size(18.0));
+                                        });
+                                    }
+                                });
+                        }
+                    }
+                });
+        }
 
         ctx.request_repaint();
     }
