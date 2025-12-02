@@ -4,7 +4,7 @@
 *.pdb
 
 # Database
-*.db
+rs3_market.db
 *.db-journal
 
 # Application state

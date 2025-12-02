@@ -26,10 +26,50 @@ git clone https://github.com/AlexMollard/rs3_analyzer.git
 cd rs3_analyzer
 ```
 
-2. Build and run:
+2. Decompress the database:
+```powershell
+# Windows
+.\decompress_db.ps1
+```
+
+```bash
+# Linux/Mac
+gunzip rs3_market.db.gz
+```
+
+3. Build and run:
 ```bash
 cargo run --release
 ```
+
+**Note**: The database file (`rs3_market.db.gz`) is compressed to ~340MB and stored with Git LFS. After cloning, you must decompress it before running the application.
+
+## Database Maintenance
+
+### Updating the Database
+
+If you need to update the database with new market data:
+
+1. Run your data collection script to update `rs3_market.db`
+2. Compress the updated database:
+```powershell
+# Windows
+.\compress_db.ps1
+```
+
+```bash
+# Linux/Mac
+gzip -k rs3_market.db  # -k keeps the original file
+```
+
+3. Commit and push the changes:
+```bash
+git add rs3_market.db.gz
+git commit -m "Update market database"
+git push
+```
+
+The compression script reduces the 1.4GB database to ~340MB, making it manageable for Git LFS.
 
 ## Usage
 
