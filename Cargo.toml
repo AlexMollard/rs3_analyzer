@@ -1,0 +1,16 @@
+[package]
+name = "rs3_analyzer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+statrs = "0.18.0"
+rayon = "1.11.0"
+
+# GUI
+eframe = "0.33.2"
+egui = "0.33.2"
+egui_extras = "0.33.2"
