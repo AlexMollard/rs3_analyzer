@@ -597,6 +597,7 @@ impl eframe::App for RS3App {
                 .column(Column::remainder().at_least(180.0).clip(true))  // Item - takes remaining space
                 .column(Column::exact(80.0))   // Score
                 .column(Column::exact(120.0))  // Tier + Trend
+                .column(Column::exact(130.0))  // Risk Warning
                 .column(Column::exact(110.0))  // Buy
                 .column(Column::exact(110.0))  // Sell
                 .column(Column::exact(70.0))   // Qty                
@@ -620,6 +621,10 @@ impl eframe::App for RS3App {
                     header.col(|ui| { 
                         ui.heading(RichText::new("Tier/Trend")
                             .color(Color32::from_rgb(200, 180, 140))); 
+                    });
+                    header.col(|ui| { 
+                        ui.heading(RichText::new("⚠ Risk")
+                            .color(Color32::from_rgb(255, 180, 100))); 
                     });
                     header.col(|ui| { 
                         ui.heading(RichText::new("Buy Price")
@@ -689,14 +694,12 @@ impl eframe::App for RS3App {
                                     self.selected_row = None;
                                     self.target_graph_height = 0.0;
                                 } else {
-                                    let old_selection = self.selected_row;
                                     self.selected_row = Some(i);
                                     self.target_graph_height = 300.0;
-                                    if old_selection != Some(i) {
-                                        self.selected_item_history.clear();
-                                        if let Ok(history) = load_item_history("rs3_market.db", &r.name) {
-                                            self.selected_item_history = history;
-                                        }
+                                    // Always reload history when selecting an item
+                                    self.selected_item_history.clear();
+                                    if let Ok(history) = load_item_history("rs3_market.db", &r.name) {
+                                        self.selected_item_history = history;
                                     }
                                 }
                             }
@@ -748,6 +751,27 @@ impl eframe::App for RS3App {
                                     ui.label(RichText::new(trend_text).color(trend_color).strong());
                                 });
                             });
+                        });
+
+                        // Risk Warning
+                        row.col(|ui| {
+                            // Parse notes to extract risk warning
+                            let (risk_text, risk_color) = if r.notes.contains("🚨VOLATILE-CRASHING") {
+                                ("🚨 Crashing", Color32::from_rgb(255, 100, 100))
+                            } else if r.notes.contains("📉Crashed") {
+                                ("📉 Crashed", Color32::from_rgb(255, 150, 100))
+                            } else if r.notes.contains("📈Spiked") {
+                                ("📈 Spiked", Color32::from_rgb(255, 200, 100))
+                            } else if r.notes.contains("⚠outliers") {
+                                ("⚠ Outliers", Color32::from_rgb(200, 180, 100))
+                            } else {
+                                ("● Stable", Color32::from_rgb(100, 255, 150))
+                            };
+                            
+                            ui.label(RichText::new(risk_text)
+                                .color(risk_color)
+                                .strong())
+                                .on_hover_text(&r.notes);
                         });
 
                         // Buy price
@@ -922,11 +946,23 @@ impl eframe::App for RS3App {
                                             .color(Color32::from_rgb(100, 200, 255))
                                             .width(2.0);
                                         
+                                        // Calculate Y-axis range to handle negative values
+                                        let prices: Vec<f64> = self.selected_item_history.iter().map(|(_, p)| *p).collect();
+                                        let min_price = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+                                        let max_price = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                                        let padding = (max_price - min_price) * 0.1;
+                                        
                                         let history_clone = self.selected_item_history.clone();
                                         Plot::new("price_history")
                                             .height(self.graph_height - 80.0)
                                             .show_axes(true)
                                             .show_grid(true)
+                                            .allow_zoom(true)
+                                            .allow_scroll(true)
+                                            .allow_drag(true)
+                                            .reset()  // Reset view when plot is recreated
+                                            .include_y(min_price - padding)
+                                            .include_y(max_price + padding)
                                             .x_axis_formatter(move |mark, _range| {
                                                 let idx = mark.value as usize;
                                                 if let Some((date, _)) = history_clone.get(idx) {

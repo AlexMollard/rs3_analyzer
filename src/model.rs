@@ -30,6 +30,10 @@ pub struct ItemStats {
     pub current_volume: f64,
     pub prices: Vec<f64>,
     pub price_trend: f64,  // Positive = rising, negative = falling
+    pub filtered_prices: Vec<f64>,  // Prices with outliers removed
+    pub outliers_removed: usize,
+    pub recent_prices: Vec<f64>,  // Last 14 records (sorted) for time-weighted analysis
+    pub recent_prices_chrono: Vec<f64>,  // Last 14 records in chronological order
 }
 
 
