@@ -15,6 +15,20 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
         let mut prices: Vec<f64> = records.iter().map(|x| x.price as f64).collect();
         let volumes: Vec<f64> = records.iter().map(|x| x.volume as f64).collect();
 
+        // Get recent prices (last 14 days) for time-weighted analysis
+        // Using 14 days instead of 30 to catch rapid crashes/spikes
+        let recent_cutoff = if records.len() >= 14 {
+            records.len() - 14
+        } else {
+            0
+        };
+        let recent_prices_chrono: Vec<f64> = records[recent_cutoff..]
+            .iter()
+            .map(|x| x.price as f64)
+            .collect();
+        let mut recent_prices = recent_prices_chrono.clone();
+        recent_prices.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
         prices.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let current = records.last().unwrap();
@@ -26,7 +40,12 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
 
         let std_dev = prices.clone().std_dev();
 
-        let price_trend = if prices.len() >= 3 {
+        // Remove outliers using IQR method (removes DXP/update spikes)
+        let (filtered_prices, outliers_removed) = remove_outliers(&prices);
+        
+        let price_trend = if filtered_prices.len() >= 3 {
+            calculate_trend(&filtered_prices)
+        } else if prices.len() >= 3 {
             calculate_trend(&prices)
         } else {
             0.0
@@ -51,6 +70,10 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
             current_volume: current.volume as f64,
             prices: prices.clone(),
             price_trend,
+            filtered_prices,
+            outliers_removed,
+            recent_prices,
+            recent_prices_chrono,
         };
 
         results.push(stats);
@@ -64,6 +87,36 @@ fn quantile(sorted: &Vec<f64>, q: f64) -> f64 {
     if sorted.is_empty() { return 0.0; }
     let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
     sorted[idx]
+}
+
+// Remove outliers using IQR method (filters DXP/update spikes)
+fn remove_outliers(prices: &[f64]) -> (Vec<f64>, usize) {
+    if prices.len() < 10 {
+        return (prices.to_vec(), 0);
+    }
+    
+    let q1 = quantile(&prices.to_vec(), 0.25);
+    let q3 = quantile(&prices.to_vec(), 0.75);
+    let iqr = q3 - q1;
+    
+    // Use 1.5 * IQR for outlier detection (standard method)
+    let lower_bound = q1 - (1.5 * iqr);
+    let upper_bound = q3 + (1.5 * iqr);
+    
+    let original_len = prices.len();
+    let filtered: Vec<f64> = prices.iter()
+        .copied()
+        .filter(|&p| p >= lower_bound && p <= upper_bound)
+        .collect();
+    
+    let removed = original_len - filtered.len();
+    
+    // Return original if we filtered too much (>30%)
+    if filtered.len() < (original_len * 7 / 10) {
+        (prices.to_vec(), 0)
+    } else {
+        (filtered, removed)
+    }
 }
 
 fn calculate_trend(prices: &[f64]) -> f64 {
