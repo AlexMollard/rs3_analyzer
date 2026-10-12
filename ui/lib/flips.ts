@@ -62,7 +62,8 @@ export function filterRows(rows: PricedRow[], f: Filters, search: string, favs: 
       (f.tier === null || r.tier === f.tier) &&
       (f.minProfit <= 0 || r.profit >= f.minProfit) &&
       (f.minRoi <= 0 || r.roi >= f.minRoi) &&
-      (f.showNegative || r.score >= 0),
+      // Tier X loses money after tax at the model's own prices: hide unless asked for
+      (f.tier === 'X' || f.showNegative || (r.score >= 0 && r.tier !== 'X')),
   );
 }
 

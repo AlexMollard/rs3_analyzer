@@ -274,7 +274,13 @@ class RS3DataCollector:
         items_to_update = []
         history_to_insert = []
         skipped = 0
-        today_str = datetime.now(timezone.utc).date().isoformat()
+        # Date rows by Jagex's price update, as the history API does; stamping the run date
+        # copies yesterday's prices onto today when the collector runs before the update
+        jagex_ts = data.get('%JAGEX_TIMESTAMP%')
+        if isinstance(jagex_ts, (int, float)) and not isinstance(jagex_ts, bool):
+            today_str = datetime.fromtimestamp(jagex_ts, tz=timezone.utc).date().isoformat()
+        else:
+            today_str = datetime.now(timezone.utc).date().isoformat()
 
         for item_id, item in data.items():
             try:

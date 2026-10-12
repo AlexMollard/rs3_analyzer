@@ -58,7 +58,7 @@ export const TIER_LABEL: Record<Tier, string> = {
   A: 'A',
   B: 'B',
   C: 'C',
-  X: 'Crash',
+  X: 'Loss',
 };
 
 /** Table label and colour class for the headline risk. */

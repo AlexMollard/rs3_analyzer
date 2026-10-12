@@ -12,8 +12,8 @@ node_modules/
 /dist/
 
 # Database
-rs3_market.db
-rs3_market.db.gz
+*.db
+*.db.gz
 *.db-journal
 *.db-wal
 *.db-shm

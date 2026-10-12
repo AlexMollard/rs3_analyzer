@@ -2,7 +2,7 @@
   import type { Tier } from '../lib/types.ts';
 
   let { tier }: { tier: Tier } = $props();
-  const title = $derived(tier === 'X' ? 'Crash tier: net loss after GE tax' : `Tier ${tier}`);
+  const title = $derived(tier === 'X' ? 'Loss tier: net loss after GE tax' : `Tier ${tier}`);
 </script>
 
 <span class="badge tier-{tier}" {title}>
