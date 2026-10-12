@@ -3,6 +3,7 @@ RS3 Market Data Historical Backfill Script
 Fetches price history from Weirdgloop API for all items, keeping the last HISTORY_DAYS
 """
 
+import argparse
 import sys
 import threading
 import time
@@ -261,11 +262,40 @@ def backfill_historical_data():
         print(f"Failed item ids ({len(failed)}): {', '.join(str(i) for i in sorted(failed))}")
     return failed
 
+
+def prune_history(history_days=HISTORY_DAYS, db_path=DB_PATH):
+    """Delete history older than history_days and compact the file. Returns rows deleted."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=history_days)).strftime('%Y-%m-%d')
+    size_before = db_path.stat().st_size
+    conn = connect_db(db_path)
+    try:
+        deleted = conn.execute("DELETE FROM history WHERE record_date < ?", (cutoff,)).rowcount
+        conn.commit()
+        conn.execute("VACUUM")  # needs free disk roughly the size of the database
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    size_after = db_path.stat().st_size
+    print(f"Deleted {deleted:,} rows older than {cutoff}")
+    print(f"Database size: {size_before / 1e6:,.1f} MB -> {size_after / 1e6:,.1f} MB")
+    return deleted
+
+
 if __name__ == "__main__":
     # Avoid UnicodeEncodeError on cp1252 consoles
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--prune", action="store_true",
+                        help=f"delete history older than {HISTORY_DAYS} days and compact the database, then exit")
+    args = parser.parse_args()
+    if args.prune:
+        if not DB_PATH.exists():
+            print(f"{DB_PATH} not found")
+            sys.exit(1)
+        prune_history()
+        sys.exit(0)
     try:
         remaining = backfill_historical_data()
     except KeyboardInterrupt:

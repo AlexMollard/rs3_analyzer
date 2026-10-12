@@ -69,7 +69,7 @@ pip install -r requirements.txt
 ```
 
 - `rs3_collector.py` - downloads today's Grand Exchange snapshot and stores one row per item for today's UTC date. Run it daily (for example from Task Scheduler). If the snapshot is unavailable it falls back to the batched latest-price API for items already in the database. It creates `rs3_market.db` if missing, retries transient failures with backoff, appends to `collector_log.txt`, and exits non-zero on failure.
-- `backfill_history.py` - fetches price history for every item already in the `items` table and inserts the missing days, keeping only the last 365 days (`HISTORY_DAYS`), the longest window the app uses. Run `rs3_collector.py` once first so `items` is populated, then run the backfill. Requests are rate limited (shared across workers), transient errors are retried, and any item ids that still fail are printed with a non-zero exit code. It is safe to re-run.
+- `backfill_history.py` - fetches price history for every item already in the `items` table and inserts the missing days, keeping only the last 365 days (`HISTORY_DAYS`), the longest window the app uses. Run `rs3_collector.py` once first so `items` is populated, then run the backfill. `python backfill_history.py --prune` deletes rows older than that window from an existing database and compacts it (keep a copy first if you want the old history). Requests are rate limited (shared across workers), transient errors are retried, and any item ids that still fail are printed with a non-zero exit code. It is safe to re-run.
 
 Both scripts resolve `rs3_market.db` and `collector_log.txt` relative to the script directory, not the current directory. Data comes from the Weird Gloop Grand Exchange APIs.
 
