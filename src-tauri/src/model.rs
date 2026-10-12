@@ -4,8 +4,8 @@ pub struct ItemSnapshot {
     pub name: String,
     pub ge_limit: Option<i32>,  // None = unknown limit
     pub record_date: String,
-    pub price: i32,
-    pub volume: i32,
+    pub price: i64,
+    pub volume: i64,
 }
 
 pub struct ItemStats {
@@ -53,8 +53,8 @@ pub struct FlipResult {
     pub score: i32,
     pub tier: String,
 
-    pub buy: i32,
-    pub sell: i32,
+    pub buy: i64,
+    pub sell: i64,
 
     pub profit: f64,  // Net profit per item after GE tax
     pub roi: f64,

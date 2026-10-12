@@ -22,14 +22,14 @@ pub struct FlipRow {
     pub name: String,
     pub score: i32,
     pub tier: &'static str,  // S, A, B, C, or X (net loss)
-    pub buy: i32,
-    pub sell: i32,
+    pub buy: i64,
+    pub sell: i64,
     pub ge_limit: Option<i32>,  // None = unknown, qty not capped
     pub unit_profit: f64,  // Net profit per item after tax
     pub roi: f64,
     pub avg_volume: f64,
     pub trend: f64,  // % change per daily sample
-    pub tax: i32,  // GE tax per item at the sell price
+    pub tax: i64,  // GE tax per item at the sell price
     pub risk: Risk,
     pub outliers: usize,
     pub data_points: usize,
@@ -44,8 +44,8 @@ pub struct FlipRow {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveRow {
-    pub buy: i32,  // instant-sell average: what a buy offer pays
-    pub sell: i32,  // instant-buy average: what a sell offer receives
+    pub buy: i64,  // instant-sell average: what a buy offer pays
+    pub sell: i64,  // instant-buy average: what a sell offer receives
     pub margin: f64,  // per item after tax
     pub volume: f64,  // median daily units on the thinner side; caps the UI's quantity
     pub unit_day: Option<f64>,  // realised profit/day of one unit at past live quotes, minus one standard error

@@ -111,7 +111,7 @@ mod tests {
         stats::build_stats,
     };
 
-    fn snap(date: String, price: i32) -> ItemSnapshot {
+    fn snap(date: String, price: i64) -> ItemSnapshot {
         ItemSnapshot {
             item_id: 1,
             name: "Test".to_string(),
@@ -122,7 +122,7 @@ mod tests {
         }
     }
 
-    fn trend_of(prices: &[i32]) -> f64 {
+    fn trend_of(prices: &[i64]) -> f64 {
         let snaps: Vec<ItemSnapshot> = prices
             .iter()
             .enumerate()
@@ -204,13 +204,13 @@ mod tests {
 
     #[test]
     fn descending_prices_give_negative_trend() {
-        let prices: Vec<i32> = (0..20).map(|i| 10_000 - i * 100).collect();
+        let prices: Vec<i64> = (0..20).map(|i| 10_000 - i * 100).collect();
         assert!(trend_of(&prices) < 0.0);
     }
 
     #[test]
     fn ascending_prices_give_positive_trend() {
-        let prices: Vec<i32> = (0..20).map(|i| 10_000 + i * 100).collect();
+        let prices: Vec<i64> = (0..20).map(|i| 10_000 + i * 100).collect();
         assert!(trend_of(&prices) > 0.0);
     }
 
@@ -219,6 +219,47 @@ mod tests {
         assert_eq!(ge_tax(49, "Coal"), 0);
         assert_eq!(ge_tax(4992, "Coal"), 99);
         assert_eq!(ge_tax(100_000_000, "Bond"), 0);
+        assert_eq!(ge_tax(5_000_000_000, "Coal"), 100_000_000);
+        assert_eq!(ge_tax(i64::MAX, "Coal"), i64::MAX / 50);
+    }
+
+    #[test]
+    fn prices_above_i32_are_read_and_scored() {
+        let path = std::env::temp_dir().join("rs3_analyzer_big_price_test.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, ge_limit INTEGER);
+                 CREATE TABLE history (item_id INTEGER, record_date TEXT, price INTEGER, volume INTEGER,
+                                       PRIMARY KEY (item_id, record_date));
+                 INSERT INTO items VALUES (1, 'Rare', 1);
+                 INSERT INTO history VALUES (1, date('now', '-3 days'), 5000000000, 3000000000);
+                 INSERT INTO history VALUES (1, date('now', '-2 days'), 5500000000, 500);
+                 INSERT INTO history VALUES (1, date('now', '-1 days'), 6000000000, 700);",
+            ).unwrap();
+        }
+        let (snaps, skipped) = load_snapshots(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((snaps.len(), skipped), (3, 0));
+        assert_eq!(snaps[0].price, 5_000_000_000);
+        let stats = build_stats(&snaps);
+        let r = crate::flips::analyze(&stats[0]);
+        assert!(r.buy > i64::from(i32::MAX) && r.sell > r.buy, "{} {}", r.buy, r.sell);
+        assert_eq!(r.profit, (r.sell - r.buy - ge_tax(r.sell, "Rare")) as f64);
+    }
+
+    /// Real scan path against the live database: cargo test real_db_scan -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_db_scan() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rs3_market.db");
+        let (snaps, skipped) = load_snapshots(&path).unwrap();
+        let stats = build_stats(&snaps);
+        let big = stats.iter().filter(|s| s.prices.last().is_some_and(|&p| p > f64::from(i32::MAX))).count();
+        let scored = stats.iter().map(crate::flips::analyze).filter(|r| r.buy > i64::from(i32::MAX)).count();
+        println!("snapshots={} skipped={} items={} items_above_i32={} scored_above_i32={}", snaps.len(), skipped, stats.len(), big, scored);
+        assert_eq!(skipped, 0);
     }
 
     #[test]

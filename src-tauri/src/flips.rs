@@ -4,11 +4,11 @@ use crate::trade::{HORIZON, Order, rt_path, rt_window, simulate};
 
 /// RS3 GE tax per item: 2% of the sale price, rounded down per item, no cap.
 /// Bonds are exempt; items under 50gp therefore pay nothing.
-pub fn ge_tax(price_per_item: i32, item_name: &str) -> i32 {
+pub fn ge_tax(price_per_item: i64, item_name: &str) -> i64 {
     if item_name == "Bond" {
         0
     } else {
-        price_per_item.max(0) / 50  // == floor(2%), without i32 overflow
+        price_per_item.max(0) / 50  // == floor(2%), without overflow
     }
 }
 
@@ -16,8 +16,8 @@ pub fn ge_tax(price_per_item: i32, item_name: &str) -> i32 {
 /// instant-buy (high) average, both the median over the days where both sides traded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LiveQuote {
-    pub buy: i32,
-    pub sell: i32,
+    pub buy: i64,
+    pub sell: i64,
     pub margin: f64,  // per unit after GE tax
     pub volume: f64,  // median daily min(instant-buy, instant-sell) volume
     pub days: usize,  // two-sided days used
@@ -42,13 +42,13 @@ pub fn live_quote(days: &[RtDay], name: &str) -> Option<LiveQuote> {
     if both.is_empty() {
         return None;
     }
-    let gp = |v: f64| v.round().clamp(0.0, f64::from(i32::MAX)) as i32;
+    let gp = |v: f64| v.round().clamp(0.0, i64::MAX as f64) as i64;
     let buy = gp(median(both.iter().map(|x| x.0).collect()));
     let sell = gp(median(both.iter().map(|x| x.1).collect()));
     Some(LiveQuote {
         buy,
         sell,
-        margin: f64::from(sell) - f64::from(buy) - f64::from(ge_tax(sell, name)),
+        margin: sell as f64 - buy as f64 - ge_tax(sell, name) as f64,
         volume: median(both.iter().map(|x| x.2).collect()),
         days: both.len(),
     })
@@ -161,7 +161,7 @@ pub fn analyze(stats: &ItemStats) -> FlipResult {
     let (lo_q, hi_q) = if use_recent { (0.15, 0.85) } else { (0.10, 0.90) };
     let lo = quantile(&prices, lo_q);
     let hi = quantile(&prices, hi_q);
-    let (buy, sell) = (lo.round() as i32, hi.round() as i32);
+    let (buy, sell) = (lo.round() as i64, hi.round() as i64);
 
     let price_range = hi - lo;
     let volatility = if q50 > 0.0 { (price_range / q50) * 100.0 } else { 0.0 };

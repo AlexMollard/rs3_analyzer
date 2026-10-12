@@ -5,5 +5,6 @@
   {"budget": 1000000, "buy": 200, "geLimit": null, "volume": 10000, "unitDay": 0.4, "qty": 1000, "expDay": 400.0},
   {"budget": 50000000, "buy": 5000, "geLimit": 1000, "volume": 9, "unitDay": 120, "qty": 0, "expDay": 0},
   {"budget": 50000000, "buy": 120000, "geLimit": 70, "volume": 1234.5, "unitDay": -850.75, "qty": 70, "expDay": -59552.5},
-  {"budget": 1000000, "buy": 100, "geLimit": 25000, "volume": 30, "unitDay": 7, "qty": 3, "expDay": 21}
+  {"budget": 1000000, "buy": 100, "geLimit": 25000, "volume": 30, "unitDay": 7, "qty": 3, "expDay": 21},
+  {"budget": 50000000000, "buy": 5000000000, "geLimit": 100, "volume": 50000, "unitDay": 1000000, "qty": 10, "expDay": 10000000}
 ]

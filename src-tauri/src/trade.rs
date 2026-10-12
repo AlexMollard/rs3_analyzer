@@ -23,8 +23,8 @@ pub struct PathDay {
 /// A buy-then-sell trade at fixed offer prices.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Order<'a> {
-    pub buy: i32,
-    pub sell: i32,
+    pub buy: i64,
+    pub sell: i64,
     pub qty: i64,  // units wanted (already capped by budget and GE limit)
     pub name: &'a str,  // for the GE tax (Bonds are exempt)
 }
@@ -45,7 +45,7 @@ impl Outcome {
 }
 
 /// Same rule as the app's priceRow: units the allocation affords, capped by the GE limit.
-pub fn order_qty(buy: i32, ge_limit: Option<i32>, alloc: f64) -> i64 {
+pub fn order_qty(buy: i64, ge_limit: Option<i32>, alloc: f64) -> i64 {
     if buy <= 0 {
         return 0;
     }
@@ -53,8 +53,8 @@ pub fn order_qty(buy: i32, ge_limit: Option<i32>, alloc: f64) -> i64 {
     ge_limit.map_or(affordable, |limit| affordable.min(i64::from(limit)))
 }
 
-fn net_of_tax(price: i32, name: &str) -> f64 {
-    f64::from(price - ge_tax(price, name))
+fn net_of_tax(price: i64, name: &str) -> f64 {
+    (price - ge_tax(price, name)) as f64
 }
 
 /// Simulates a trade signalled at the end of day `t`:
@@ -71,7 +71,7 @@ pub fn simulate(order: &Order, t: i64, path: &[PathDay], vol_share: f64) -> Outc
     }
     let end = t + HORIZON;
     let days: Vec<&PathDay> = path.iter().filter(|d| d.day > t && d.day <= end).collect();
-    let bid = f64::from(order.buy);
+    let bid = order.buy as f64;
     let entry = days.iter().enumerate().find_map(|(i, d)| {
         let qty = order.qty.min((vol_share * d.buy_volume).floor() as i64);
         (qty > 0 && d.buy_px.is_some_and(|p| p <= bid)).then_some((i, qty))
@@ -80,7 +80,7 @@ pub fn simulate(order: &Order, t: i64, path: &[PathDay], vol_share: f64) -> Outc
         return Outcome::default();
     };
 
-    let ask = f64::from(order.sell);
+    let ask = order.sell as f64;
     let mut left = qty;
     let mut proceeds = 0.0;
     let mut last_sale = days[entry].day;
@@ -101,7 +101,7 @@ pub fn simulate(order: &Order, t: i64, path: &[PathDay], vol_share: f64) -> Outc
     if forced > 0 {
         // The entry day always has a price (its buy-side proxy reached the bid)
         let px = days[entry..].iter().rev().find_map(|d| d.exit_px).or(days[entry].buy_px).unwrap_or(bid);
-        let px = px.round().clamp(0.0, f64::from(i32::MAX)) as i32;
+        let px = px.round().clamp(0.0, i64::MAX as f64) as i64;
         proceeds += left as f64 * net_of_tax(px, order.name);
         last_sale = end;
     }
@@ -141,7 +141,7 @@ mod tests {
         PathDay { day, buy_px: Some(px), sell_px: Some(px), exit_px: Some(px), buy_volume: volume, sell_volume: volume }
     }
 
-    fn order(buy: i32, sell: i32, qty: i64) -> Order<'static> {
+    fn order(buy: i64, sell: i64, qty: i64) -> Order<'static> {
         Order { buy, sell, qty, name: "Coal" }
     }
 

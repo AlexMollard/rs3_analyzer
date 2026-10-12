@@ -39,7 +39,7 @@ fn snapshot_from_row(row: &rusqlite::Row) -> Result<ItemSnapshot> {
         ge_limit: row.get(2)?,
         record_date: row.get(3)?,
         price: row.get(4)?,
-        volume: row.get::<_, Option<i32>>(5)?.unwrap_or(0),
+        volume: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
     })
 }
 
@@ -139,8 +139,8 @@ pub fn load_rt(db_path: impl AsRef<Path>, days: Option<i64>) -> Result<(Vec<RtRo
 #[derive(serde::Serialize)]
 pub struct HistoryRow {
     pub date: String,
-    pub price: i32,
-    pub volume: i32,  // 0 when unknown
+    pub price: i64,
+    pub volume: i64,  // 0 when unknown
 }
 
 pub fn load_item_history(db_path: impl AsRef<Path>, item_id: i32) -> Result<Vec<HistoryRow>> {
@@ -158,7 +158,7 @@ pub fn load_item_history(db_path: impl AsRef<Path>, item_id: i32) -> Result<Vec<
         Ok(HistoryRow {
             date: row.get(0)?,
             price: row.get(1)?,
-            volume: row.get::<_, Option<i32>>(2)?.unwrap_or(0),
+            volume: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
         })
     })?;
 

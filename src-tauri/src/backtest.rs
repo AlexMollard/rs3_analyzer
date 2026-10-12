@@ -155,8 +155,8 @@ pub fn date_string(day: i64) -> String {
 pub struct Signal {
     pub score: f64,  // budget-independent score; negative rows are hidden
     pub tier: &'static str,
-    pub buy: i32,  // bid
-    pub sell: i32,  // ask
+    pub buy: i64,  // bid
+    pub sell: i64,  // ask
     pub roi: f64,
     pub volume: f64,  // 90-day average guide volume, checked by the min-volume filter
     pub liquidity: f64,  // units/day the order size is capped from (VOLUME_SHARE of it)
@@ -261,8 +261,8 @@ fn margin_tier(margin: f64, roi: f64) -> &'static str {
 }
 
 /// Tier from expected profit per day as a share of the buy price (budget-independent).
-pub fn rate_tier(unit_day: f64, buy: i32) -> &'static str {
-    let rate = if buy > 0 { unit_day / f64::from(buy) } else { 0.0 };
+pub fn rate_tier(unit_day: f64, buy: i64) -> &'static str {
+    let rate = if buy > 0 { unit_day / buy as f64 } else { 0.0 };
     if rate < 0.0 {
         "X"
     } else if rate >= 0.01 {
@@ -276,8 +276,8 @@ pub fn rate_tier(unit_day: f64, buy: i32) -> &'static str {
     }
 }
 
-fn margin_signal(base: Signal, buy: i32, sell: i32, margin: f64, liquidity: f64) -> Signal {
-    let roi = if buy > 0 { margin / f64::from(buy) * 100.0 } else { 0.0 };
+fn margin_signal(base: Signal, buy: i64, sell: i64, margin: f64, liquidity: f64) -> Signal {
+    let roi = if buy > 0 { margin / buy as f64 * 100.0 } else { 0.0 };
     Signal { score: margin, tier: margin_tier(margin, roi), buy, sell, roi, liquidity, ..base }
 }
 
@@ -290,9 +290,9 @@ fn band_signal(s: &Series, t: i64, days: i64, lo: u8, hi: u8) -> Option<Signal> 
         return None;
     }
     recent.sort_by(f64::total_cmp);
-    let q = |p: u8| recent[((recent.len() - 1) as f64 * f64::from(p) / 100.0).round() as usize].round() as i32;
+    let q = |p: u8| recent[((recent.len() - 1) as f64 * f64::from(p) / 100.0).round() as usize].round() as i64;
     let (buy, sell) = (q(lo), q(hi));
-    let margin = f64::from(sell) - f64::from(buy) - f64::from(ge_tax(sell, &s.name));
+    let margin = sell as f64 - buy as f64 - ge_tax(sell, &s.name) as f64;
     let volume = base.volume;
     Some(margin_signal(base, buy, sell, margin, volume))
 }
@@ -315,7 +315,7 @@ fn empirical_score(
     lookback: i64,
     lcb: bool,
     mode: FillMode,
-    quote: impl Fn(i64) -> Option<(i32, i32)>,
+    quote: impl Fn(i64) -> Option<(i64, i64)>,
 ) -> Option<f64> {
     let past: Vec<f64> = (t - lookback..t - HORIZON)
         .filter_map(|tp| {
@@ -342,7 +342,7 @@ fn empirical_signal(s: &Series, t: i64, days: i64, lookback: i64, lcb: bool) -> 
 fn empirical_guide_signal(s: &Series, t: i64, lookback: i64, lcb: bool) -> Option<Signal> {
     let base = baseline_signal(s, t)?;
     let score = empirical_score(s, t, lookback, lcb, FillMode::Guide, |tp| baseline_signal(s, tp).map(|b| (b.buy, b.sell)))?;
-    let margin = f64::from(base.sell) - f64::from(base.buy) - f64::from(ge_tax(base.sell, &s.name));
+    let margin = base.sell as f64 - base.buy as f64 - ge_tax(base.sell, &s.name) as f64;
     let (buy, sell, volume) = (base.buy, base.sell, base.volume);
     let mut sig = margin_signal(base, buy, sell, margin, volume);
     sig.score = score;
@@ -384,7 +384,7 @@ pub fn forward_path(s: &Series, t: i64, mode: FillMode) -> Vec<PathDay> {
 pub struct Filters {
     pub min_volume: f64,
     pub max_roi: f64,
-    pub min_buy: i32,
+    pub min_buy: i64,
 }
 
 /// The app's default filters (ui/lib/flips.ts); negative scores are hidden too.
@@ -424,11 +424,11 @@ pub struct Acc {
 }
 
 impl Acc {
-    fn add(&mut self, o: &Outcome, buy: i32) {
+    fn add(&mut self, o: &Outcome, buy: i64) {
         self.n += 1;
         self.rate += o.per_day();
         self.profit += o.profit;
-        self.cost += o.qty as f64 * f64::from(buy);
+        self.cost += o.qty as f64 * buy as f64;
         if o.qty > 0 {
             self.filled += 1;
             self.hits += usize::from(o.profit > 0.0);
@@ -822,7 +822,7 @@ pub fn compare(base: &[DayResult], cand: &[DayResult], ki: usize, step: i64) -> 
 mod tests {
     use super::*;
 
-    fn synthetic(item_id: i32, days: i64, price: impl Fn(i64) -> i32) -> Series {
+    fn synthetic(item_id: i32, days: i64, price: impl Fn(i64) -> i64) -> Series {
         let start = day_number("2026-01-01").unwrap();
         let snaps = (0..days)
             .map(|i| ItemSnapshot {
@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn signals_never_see_rows_after_t() {
-        let mut s = synthetic(1, 120, |i| 10_000 + (i % 9) as i32 * 250 - (i / 30) as i32 * 300);
+        let mut s = synthetic(1, 120, |i| 10_000 + (i % 9) * 250 - (i / 30) * 300);
         let t = s.days[100];
         s.rt = (t - 10..=t + 5)
             .map(|d| {
@@ -914,7 +914,7 @@ mod tests {
     #[test]
     fn evaluate_runs_end_to_end() {
         // An item that swings 10,000..11,600 every 5 days fills and sells; a flat one never does
-        let series = vec![synthetic(1, 130, |i| 10_000 + (i % 5) as i32 * 400), synthetic(2, 130, |_| 5_000)];
+        let series = vec![synthetic(1, 130, |i| 10_000 + (i % 5) * 400), synthetic(2, 130, |_| 5_000)];
         let start = series[0].days[0];
         let cfg = EvalConfig {
             budgets: vec![50_000_000.0],
@@ -947,7 +947,7 @@ mod tests {
         #[serde(rename_all = "camelCase")]
         struct Case {
             budget: f64,
-            buy: i32,
+            buy: i64,
             ge_limit: Option<i32>,
             volume: f64,
             unit_day: f64,
