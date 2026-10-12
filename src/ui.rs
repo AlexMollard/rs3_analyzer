@@ -4,8 +4,13 @@ use egui::{
     Color32, Context, FontFamily, FontId, Margin, RichText, Visuals, Stroke, Vec2
 };
 use egui_extras::{Column, TableBuilder};
-use egui_plot::{HoverPosition, Line, Plot, PlotPoints};
+use egui_plot::{HoverPosition, Line, Plot, PlotPoint};
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+const DB_PATH: &str = "rs3_market.db";
+const MISSING_DB_MSG: &str = "rs3_market.db not found — run decompress_db.ps1 or backfill_history.py";
+const FAVORITES_PATH: &str = "favorites.json";
 
 pub fn set_custom_style(ctx: &Context) {
     // RS3 Grand Exchange dark gold UI theme
@@ -31,48 +36,50 @@ pub fn set_custom_style(ctx: &Context) {
     visuals.selection.bg_fill = Color32::from_rgb(100, 80, 50);
     visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(255, 210, 100));
 
-    ctx.set_visuals(visuals);
+    // Apply to both dark and light styles so the theme is the same whatever the OS preference
+    ctx.all_styles_mut(|style| {
+        style.visuals = visuals.clone();
 
-    // RS3 fonts + spacing
-    let mut style = (*ctx.global_style()).clone();
+        // RS3 fonts + spacing
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.window_margin = Margin::same(12);
+        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.indent = 16.0;
 
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.window_margin = Margin::same(12);
-    style.spacing.button_padding = egui::vec2(12.0, 8.0);
-    style.spacing.indent = 16.0;
-
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        FontId::new(15.0, FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Heading,
-        FontId::new(22.0, FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        FontId::new(15.0, FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Monospace,
-        FontId::new(14.0, FontFamily::Monospace),
-    );
-
-    ctx.set_global_style(style);
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            FontId::new(15.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            FontId::new(22.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            FontId::new(15.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            FontId::new(14.0, FontFamily::Monospace),
+        );
+    });
 }
 
 #[derive(Clone)]
 struct Row {
+    item_id: i32,
     name: String,
     score: i32,
     tier: String,
     buy: f64,
     sell: i32,
+    ge_limit: Option<i32>,  // None = unknown, qty not capped
+    unit_profit: f64,  // Net profit per item after tax
     qty: i32,
-    profit: f64,
+    profit: f64,  // Total profit for qty items
     roi: f64,
     notes: String,
-    trend: f64,  // Price trend indicator
+    trend: f64,  // Price trend indicator (% per sample)
     total_cost: f64,  // Total cost of buying qty items
     avg_volume: f64,
 }
@@ -81,10 +88,87 @@ struct Row {
 enum SortBy {
     Score,
     Profit,
-    ROI,
+    Roi,
     Name,
     Buy,
     Sell,
+}
+
+impl SortBy {
+    fn label(self) -> &'static str {
+        match self {
+            SortBy::Score => "Score",
+            SortBy::Profit => "Profit",
+            SortBy::Roi => "ROI",
+            SortBy::Name => "Name",
+            SortBy::Buy => "Buy",
+            SortBy::Sell => "Sell",
+        }
+    }
+}
+
+type LoadResult = Result<(Vec<Row>, usize), String>;
+
+// Runs on a background thread: DB query + stats + flip analysis.
+// Quantities are left at 0; they depend on the budget and are filled in on the UI thread.
+fn compute_rows(db_path: &str) -> LoadResult {
+    if !std::path::Path::new(db_path).exists() {
+        return Err(MISSING_DB_MSG.to_string());
+    }
+
+    let (snaps, skipped) = load_snapshots(db_path).map_err(|e| {
+        // An empty file (e.g. created by an older build) opens fine but has no tables
+        if e.to_string().contains("no such table") {
+            MISSING_DB_MSG.to_string()
+        } else {
+            format!("Failed to load {}: {}", db_path, e)
+        }
+    })?;
+
+    let stats = build_stats(&snaps);
+
+    let mut rows = vec![];
+
+    for s in stats {
+        if s.data_points < 1 { continue; }
+
+        let f = analyze(&s);
+
+        rows.push(Row {
+            item_id: s.item_id,
+            name: s.name.clone(),
+            score: f.score,
+            tier: f.tier.clone(),
+            buy: f.buy as f64,
+            sell: f.sell,
+            ge_limit: s.ge_limit,
+            unit_profit: f.profit,
+            qty: 0,
+            profit: 0.0,
+            roi: f.roi,
+            notes: f.notes.clone(),
+            trend: s.price_trend,
+            total_cost: 0.0,
+            avg_volume: f.avg_volume,
+        });
+    }
+
+    Ok((rows, skipped))
+}
+
+// Single source for the trend thresholds (relative trend, % per sample)
+fn trend_indicator(trend: f64) -> (&'static str, &'static str, Color32) {
+    if trend > 1.0 {
+        ("↑↑", "Rising++", Color32::from_rgb(100, 255, 100))
+    } else if trend > 0.2 {
+        ("↑", "Rising+", Color32::from_rgb(150, 255, 150))
+    } else if trend < -1.0 {
+        ("↓↓", "Falling--", Color32::from_rgb(255, 100, 100))
+    } else if trend < -0.2 {
+        ("↓", "Falling-", Color32::from_rgb(255, 150, 150))
+    } else {
+        ("→", "Stable", Color32::from_rgb(200, 200, 200))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,18 +196,27 @@ pub struct RS3App {
     show_favorites_only: bool,
     
     // UI state
-    selected_row: Option<usize>,
-    
-    favorites: HashMap<String, bool>,
-    
+    selected_item: Option<i32>,  // item_id, stable across re-sort/filter
+
+    favorites: HashMap<String, bool>,  // Keyed by name for compatibility with existing files
+    favorites_writable: bool,  // false if an existing favorites file could not be read or backed up
+
     selected_item_history: Vec<(String, f64)>,
+    history_points: Vec<PlotPoint>,  // Cached plot points for selected_item_history
+    history_y_range: (f64, f64),
+    plot_needs_reset: bool,
     graph_height: f32,
     target_graph_height: f32,
+
+    // Background load
+    load_rx: Option<Receiver<LoadResult>>,
+    status: String,
+    status_is_error: bool,
 }
 
 impl RS3App {
     pub fn new() -> Self {
-        let favorites = Self::load_favorites();
+        let (favorites, favorites_writable, favorites_status) = Self::load_favorites();
         Self {
             loaded: false,
             items: vec![],
@@ -140,78 +233,159 @@ impl RS3App {
             selected_tier: None,
             show_favorites_only: false,
             
-            selected_row: None,
-            
+            selected_item: None,
+
             favorites,
-            
+            favorites_writable,
+
             selected_item_history: vec![],
+            history_points: vec![],
+            history_y_range: (0.0, 0.0),
+            plot_needs_reset: false,
             graph_height: 0.0,
             target_graph_height: 0.0,
+
+            load_rx: None,
+            status_is_error: favorites_status.is_some(),
+            status: favorites_status.unwrap_or_default(),
         }
     }
-    
-    fn load_favorites() -> HashMap<String, bool> {
+
+    /// Returns (favorites, writable, status message).
+    /// A corrupt file is moved to favorites.json.bak instead of being silently overwritten.
+    fn load_favorites() -> (HashMap<String, bool>, bool, Option<String>) {
         use std::fs;
-        if let Ok(data) = fs::read_to_string("favorites.json") {
-            serde_json::from_str(&data).unwrap_or_default()
-        } else {
-            HashMap::new()
-        }
-    }
-    
-    fn save_favorites(&self) {
-        use std::fs;
-        if let Ok(json) = serde_json::to_string(&self.favorites) {
-            let _ = fs::write("favorites.json", json);
-        }
-    }
-
-    fn load_data(&mut self) {
-        let tax = 0.02;
-
-        let result = load_snapshots("rs3_market.db");
-
-        let snaps = match result {
-            Ok(v) => v,
-            Err(_) => return,
+        let data = match fs::read_to_string(FAVORITES_PATH) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (HashMap::new(), true, None),
+            Err(e) => {
+                return (HashMap::new(), false, Some(format!(
+                    "Could not read {}: {} — favorites will not be saved this session", FAVORITES_PATH, e)));
+            }
         };
+        match serde_json::from_str(&data) {
+            Ok(map) => (map, true, None),
+            Err(e) => {
+                let bak = format!("{}.bak", FAVORITES_PATH);
+                match fs::rename(FAVORITES_PATH, &bak) {
+                    Ok(()) => (HashMap::new(), true, Some(format!(
+                        "{} was corrupt ({}); moved it to {} and started with no favorites", FAVORITES_PATH, e, bak))),
+                    Err(re) => (HashMap::new(), false, Some(format!(
+                        "{} is corrupt ({}) and could not be backed up ({}) — favorites will not be saved this session",
+                        FAVORITES_PATH, e, re))),
+                }
+            }
+        }
+    }
 
-        let stats = build_stats(&snaps);
+    // Write to a temp file then rename, so a crash mid-write never leaves a truncated file
+    fn save_favorites(&mut self) {
+        use std::fs;
+        if !self.favorites_writable {
+            self.set_status(format!("Favorites not saved: existing {} could not be read or backed up", FAVORITES_PATH), true);
+            return;
+        }
+        let tmp = format!("{}.tmp", FAVORITES_PATH);
+        let result = serde_json::to_string(&self.favorites)
+            .map_err(|e| e.to_string())
+            .and_then(|json| fs::write(&tmp, json).map_err(|e| e.to_string()))
+            .and_then(|()| fs::rename(&tmp, FAVORITES_PATH).map_err(|e| e.to_string()));
+        if let Err(e) = result {
+            self.set_status(format!("Failed to save {}: {}", FAVORITES_PATH, e), true);
+        }
+    }
 
-        let mut rows = vec![];
+    fn set_status(&mut self, msg: String, is_error: bool) {
+        self.status = msg;
+        self.status_is_error = is_error;
+    }
 
-        for s in stats {
-            if s.data_points < 1 { continue; }
+    fn start_load(&mut self, ctx: &Context) {
+        if self.load_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(compute_rows(DB_PATH));
+            ctx.request_repaint();
+        });
+        self.load_rx = Some(rx);
+        self.set_status("Scanning market...".to_string(), false);
+    }
 
-            let f = analyze(&s, tax);
+    fn poll_load(&mut self) {
+        let Some(rx) = &self.load_rx else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("Market scan failed unexpectedly".to_string()),
+        };
+        self.load_rx = None;
+        match result {
+            Ok((rows, skipped)) => {
+                self.items = rows;
+                self.loaded = true;
+                // Drop the selection if the item disappeared from the new data
+                if let Some(id) = self.selected_item
+                    && !self.items.iter().any(|r| r.item_id == id)
+                {
+                    self.clear_selection();
+                }
+                self.recompute_quantities();
+                let mut msg = format!("Loaded {} items", self.items.len());
+                if skipped > 0 {
+                    msg.push_str(&format!(" ({} unreadable rows skipped)", skipped));
+                }
+                self.set_status(msg, skipped > 0);
+            }
+            Err(e) => self.set_status(e, true),
+        }
+    }
 
-            let qty = if f.buy > 0 {
-                ((self.budget / f.buy as f64) as i32).min(s.ge_limit)
+    // Budget only affects quantity, so recompute from cached results without touching the DB
+    fn recompute_quantities(&mut self) {
+        for r in &mut self.items {
+            let qty = if r.buy > 0.0 {
+                let affordable = (self.budget / r.buy) as i32;
+                match r.ge_limit {
+                    Some(limit) => affordable.min(limit),
+                    None => affordable,
+                }
             } else {
                 0
             };
-            let total_profit = f.profit as f64 * qty as f64;
-            let total_cost = f.buy as f64 * qty as f64;
-
-            rows.push(Row {
-                name: s.name.clone(),
-                score: f.score,
-                tier: f.tier.clone(),
-                buy: f.buy as f64,
-                sell: f.sell,
-                qty,
-                profit: total_profit,
-                roi: f.roi,
-                notes: f.notes.clone(),
-                trend: s.price_trend,
-                total_cost,
-                avg_volume: f.avg_volume,
-            });
+            r.qty = qty;
+            r.profit = (r.unit_profit * qty as f64).round();
+            r.total_cost = r.buy * qty as f64;
         }
-
-        self.items = rows;
         self.apply_filters();
-        self.loaded = true;
+    }
+
+    fn select_item(&mut self, item_id: i32) {
+        self.selected_item = Some(item_id);
+        self.target_graph_height = 300.0;
+        self.plot_needs_reset = true;
+        // Always reload history when selecting an item
+        self.selected_item_history = load_item_history(DB_PATH, item_id).unwrap_or_else(|e| {
+            eprintln!("load_item_history({}): {}", item_id, e);
+            vec![]
+        });
+        self.history_points = self.selected_item_history
+            .iter()
+            .enumerate()
+            .map(|(i, (_, price))| PlotPoint::new(i as f64, *price))
+            .collect();
+        let min_price = self.history_points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+        let max_price = self.history_points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+        self.history_y_range = (min_price, max_price);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_item = None;
+        self.target_graph_height = 0.0;
+        self.selected_item_history.clear();
+        self.history_points.clear();
     }
 
     fn apply_filters(&mut self) {
@@ -248,7 +422,7 @@ impl RS3App {
         }
 
         if !self.show_bad {
-            filtered.retain(|r| r.score > 0);
+            filtered.retain(|r| r.score >= 0);
         }
 
         match self.sort_by {
@@ -261,16 +435,16 @@ impl RS3App {
             }),
             SortBy::Profit => filtered.sort_by(|a, b| {
                 if self.sort_order == SortOrder::Descending {
-                    b.profit.partial_cmp(&a.profit).unwrap()
+                    b.profit.total_cmp(&a.profit)
                 } else {
-                    a.profit.partial_cmp(&b.profit).unwrap()
+                    a.profit.total_cmp(&b.profit)
                 }
             }),
-            SortBy::ROI => filtered.sort_by(|a, b| {
+            SortBy::Roi => filtered.sort_by(|a, b| {
                 if self.sort_order == SortOrder::Descending {
-                    b.roi.partial_cmp(&a.roi).unwrap()
+                    b.roi.total_cmp(&a.roi)
                 } else {
-                    a.roi.partial_cmp(&b.roi).unwrap()
+                    a.roi.total_cmp(&b.roi)
                 }
             }),
             SortBy::Name => filtered.sort_by(|a, b| {
@@ -282,9 +456,9 @@ impl RS3App {
             }),
             SortBy::Buy => filtered.sort_by(|a, b| {
                 if self.sort_order == SortOrder::Descending {
-                    b.buy.partial_cmp(&a.buy).unwrap()
+                    b.buy.total_cmp(&a.buy)
                 } else {
-                    a.buy.partial_cmp(&b.buy).unwrap()
+                    a.buy.total_cmp(&b.buy)
                 }
             }),
             SortBy::Sell => filtered.sort_by(|a, b| {
@@ -308,25 +482,13 @@ impl RS3App {
             _         => Color32::LIGHT_GRAY,
         }
     }
-
-    fn tier_badge<'a>(&self, ui: &mut egui::Ui, tier: &str) {
-        let (icon, text, color) = match tier {
-            "DIAMOND" => ("◆", "Diamond", Color32::from_rgb(100, 200, 255)),
-            "GOLD" => ("★", "Gold", Color32::from_rgb(255, 215, 0)),
-            "GREEN" => ("✓", "Good", Color32::from_rgb(100, 255, 150)),
-            "CRASH" => ("▼", "Crash", Color32::from_rgb(255, 100, 100)),
-            _ => ("●", "Normal", Color32::from_rgb(180, 180, 180)),
-        };
-        
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(icon).size(18.0).color(color));
-            ui.label(RichText::new(text).color(color).small());
-        });
-    }
 }
 
 impl eframe::App for RS3App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_load();
+        let loading = self.load_rx.is_some();
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             
@@ -347,13 +509,19 @@ impl eframe::App for RS3App {
 
             ui.horizontal(|ui| {
                 // Scan button - prominent RS3 style
-                if ui.add_sized(
-                    Vec2::new(100.0, 32.0),
-                    egui::Button::new(RichText::new("🔍 Scan Market")
-                        .color(Color32::from_rgb(255, 220, 100))
-                        .strong())
-                ).clicked() {
-                    self.load_data();
+                let scan_clicked = ui.add_enabled_ui(!loading, |ui| {
+                    ui.add_sized(
+                        Vec2::new(100.0, 32.0),
+                        egui::Button::new(RichText::new("🔍 Scan Market")
+                            .color(Color32::from_rgb(255, 220, 100))
+                            .strong())
+                    ).clicked()
+                }).inner;
+                if scan_clicked {
+                    self.start_load(ui.ctx());
+                }
+                if loading {
+                    ui.spinner();
                 }
 
                 ui.separator();
@@ -370,7 +538,7 @@ impl eframe::App for RS3App {
                 {
                     self.budget = (b * 1_000_000.0).max(100_000.0);
                     if self.loaded {
-                        self.load_data();
+                        self.recompute_quantities();
                     }
                 }
 
@@ -383,10 +551,18 @@ impl eframe::App for RS3App {
                         .hint_text("Search items...")
                         .desired_width(200.0)
                 );
-                if search_response.changed() {
-                    if self.loaded {
-                        self.apply_filters();
-                    }
+                if search_response.changed() && self.loaded {
+                    self.apply_filters();
+                }
+
+                if !self.status.is_empty() {
+                    ui.separator();
+                    let color = if self.status_is_error {
+                        Color32::from_rgb(255, 120, 100)
+                    } else {
+                        Color32::from_rgb(180, 160, 120)
+                    };
+                    ui.label(RichText::new(&self.status).color(color));
                 }
 
             });
@@ -433,11 +609,9 @@ impl eframe::App for RS3App {
                             }
                         });
                         
-                        if self.selected_tier.is_some() {
-                            if ui.button("Clear Tier Filter").clicked() {
-                                self.selected_tier = None;
-                                self.apply_filters();
-                            }
+                        if self.selected_tier.is_some() && ui.button("Clear Tier Filter").clicked() {
+                            self.selected_tier = None;
+                            self.apply_filters();
                         }
                         
                         ui.add_space(10.0);
@@ -493,18 +667,18 @@ impl eframe::App for RS3App {
                         ui.label(RichText::new("📊 Sort By").strong());
                         
                         egui::ComboBox::from_id_salt("sort_by")
-                            .selected_text(format!("{:?}", self.sort_by))
+                            .selected_text(self.sort_by.label())
                             .show_ui(ui, |ui| {
                                 let sorts = [
-                                    SortBy::Score, 
-                                    SortBy::Profit, 
-                                    SortBy::ROI, 
+                                    SortBy::Score,
+                                    SortBy::Profit,
+                                    SortBy::Roi,
                                     SortBy::Name,
                                     SortBy::Buy,
                                     SortBy::Sell
                                 ];
                                 for sort in sorts {
-                                    if ui.selectable_value(&mut self.sort_by, sort, format!("{:?}", sort)).clicked() {
+                                    if ui.selectable_value(&mut self.sort_by, sort, sort.label()).clicked() {
                                         self.apply_filters();
                                     }
                                 }
@@ -543,116 +717,123 @@ impl eframe::App for RS3App {
                 });
         }
 
-        self.graph_height += (self.target_graph_height - self.graph_height) * 0.2;
+        // Frame-rate independent ease: ~0.2 of the remaining distance per frame at 60 fps
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        self.graph_height += (self.target_graph_height - self.graph_height) * (1.0 - (-13.4 * dt).exp());
         if (self.target_graph_height - self.graph_height).abs() < 0.5 {
             self.graph_height = self.target_graph_height;
         }
 
+        // Look the selection up in all items (not just filtered ones) so the panel and its ✖
+        // stay available when the selected item is filtered out
+        let selected_row = self.selected_item
+            .and_then(|id| self.items.iter().find(|r| r.item_id == id));
+        let mut close_clicked = false;
+        let mut plot_rendered = false;
+
         if self.graph_height > 1.0 {
             egui::Panel::bottom("graph_panel")
-                .min_size(self.graph_height)
-                .max_size(self.graph_height)
+                .exact_size(self.graph_height)
+                .resizable(false)
                 .show(ui, |ui| {
-                    if let Some(idx) = self.selected_row {
-                        if let Some(r) = self.filtered_items.get(idx) {
-                            egui::Frame::new()
-                                .fill(Color32::from_rgb(35, 28, 18))
-                                .stroke(Stroke::new(2.0, Color32::from_rgb(100, 80, 50)))
-                                .inner_margin(Margin::same(12))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("⎘ Price History:")
-                                            .color(Color32::from_rgb(255, 210, 100))
-                                            .strong()
-                                            .size(16.0));
-                                        
-                                        ui.label(RichText::new(&r.name)
-                                            .color(Color32::from_rgb(255, 220, 150))
-                                            .size(16.0));
-                                        
-                                        ui.separator();
-                                        
-                                        ui.label(RichText::new(&r.notes)
-                                            .color(Color32::from_rgb(180, 160, 120))
-                                            .italics());
+                    if let Some(r) = selected_row {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(35, 28, 18))
+                            .stroke(Stroke::new(2.0, Color32::from_rgb(100, 80, 50)))
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("⎘ Price History:")
+                                        .color(Color32::from_rgb(255, 210, 100))
+                                        .strong()
+                                        .size(16.0));
 
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if ui.button(RichText::new("✖").size(16.0)).clicked() {
-                                                self.selected_row = None;
-                                                self.target_graph_height = 0.0;
-                                                self.selected_item_history.clear();
-                                            }
-                                        });
+                                    ui.label(RichText::new(&r.name)
+                                        .color(Color32::from_rgb(255, 220, 150))
+                                        .size(16.0));
+
+                                    ui.separator();
+
+                                    ui.label(RichText::new(&r.notes)
+                                        .color(Color32::from_rgb(180, 160, 120))
+                                        .italics());
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button(RichText::new("✖").size(16.0)).clicked() {
+                                            close_clicked = true;
+                                        }
                                     });
-                                    
-                                    if !self.selected_item_history.is_empty() {
-                                        ui.add_space(5.0);
-                                        
-                                        let points: PlotPoints = self.selected_item_history
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, (_, price))| [i as f64, *price])
-                                            .collect();
-                                        
-                                        let line = Line::new("Price", points)
-                                            .color(Color32::from_rgb(100, 200, 255))
-                                            .width(2.0);
-                                        
-                                        // Calculate Y-axis range to handle negative values
-                                        let prices: Vec<f64> = self.selected_item_history.iter().map(|(_, p)| *p).collect();
-                                        let min_price = prices.iter().cloned().fold(f64::INFINITY, f64::min);
-                                        let max_price = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                                        let padding = (max_price - min_price) * 0.1;
-                                        
-                                        let history_clone = self.selected_item_history.clone();
-                                        Plot::new("price_history")
-                                            .height(self.graph_height - 80.0)
-                                            .show_axes(true)
-                                            .show_grid(true)
-                                            .allow_zoom(true)
-                                            .allow_scroll(true)
-                                            .allow_drag(true)
-                                            .reset()  // Reset view when plot is recreated
-                                            .include_y(min_price - padding)
-                                            .include_y(max_price + padding)
-                                            .x_axis_formatter(move |mark, _range| {
-                                                let idx = mark.value as usize;
-                                                if let Some((date, _)) = history_clone.get(idx) {
-                                                    if date.len() >= 10 {
-                                                        date[5..10].to_string()
-                                                    } else {
-                                                        date.clone()
-                                                    }
-                                                } else {
-                                                    String::new()
-                                                }
-                                            })
-                                            .label_formatter(|pos| {
-                                                let value = match pos {
-                                                    HoverPosition::NearDataPoint { position, .. }
-                                                    | HoverPosition::Elsewhere { position } => position,
-                                                };
-                                                Some(if let Some((date, _)) = self.selected_item_history.get(value.x as usize) {
-                                                    format!("{}\nPrice: {}", date, format_gp(value.y))
-                                                } else {
-                                                    format!("Price: {}", format_gp(value.y))
-                                                })
-                                            })
-                                            .show(ui, |plot_ui| {
-                                                plot_ui.line(line);
-                                            });
-                                    } else {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(RichText::new("Loading price history...")
-                                                .color(Color32::from_rgb(180, 160, 120))
-                                                .italics()
-                                                .size(18.0));
-                                        });
-                                    }
                                 });
-                        }
+
+                                if !self.history_points.is_empty() {
+                                    ui.add_space(5.0);
+
+                                    let line = Line::new("Price", &self.history_points[..])
+                                        .color(Color32::from_rgb(100, 200, 255))
+                                        .width(2.0);
+
+                                    // Calculate Y-axis range to handle negative values
+                                    let (min_price, max_price) = self.history_y_range;
+                                    let padding = (max_price - min_price) * 0.1;
+
+                                    let history = &self.selected_item_history;
+                                    let mut plot = Plot::new("price_history")
+                                        .height(self.graph_height - 80.0)
+                                        .show_axes(true)
+                                        .show_grid(true)
+                                        .allow_zoom(true)
+                                        .allow_scroll(true)
+                                        .allow_drag(true)
+                                        .include_y(min_price - padding)
+                                        .include_y(max_price + padding)
+                                        .x_axis_formatter(move |mark, _range| {
+                                            match history_date(history, mark.value) {
+                                                Some(date) if date.len() >= 10 => date[5..10].to_string(),
+                                                Some(date) => date.clone(),
+                                                None => String::new(),
+                                            }
+                                        })
+                                        .label_formatter(move |pos| {
+                                            let (date, value) = match pos {
+                                                HoverPosition::NearDataPoint { position, index, .. } => {
+                                                    (history.get(*index).map(|(d, _)| d), position)
+                                                }
+                                                HoverPosition::Elsewhere { position } => {
+                                                    (history_date(history, position.x), position)
+                                                }
+                                            };
+                                            Some(if let Some(date) = date {
+                                                format!("{}\nPrice: {}", date, format_gp(value.y))
+                                            } else {
+                                                format!("Price: {}", format_gp(value.y))
+                                            })
+                                        });
+                                    // Reset the view only when the selection changes, so zoom/pan sticks
+                                    if self.plot_needs_reset {
+                                        plot = plot.reset();
+                                    }
+                                    plot.show(ui, |plot_ui| {
+                                        plot_ui.line(line);
+                                    });
+                                    plot_rendered = true;
+                                } else {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(RichText::new("No price history")
+                                            .color(Color32::from_rgb(180, 160, 120))
+                                            .italics()
+                                            .size(18.0));
+                                    });
+                                }
+                            });
                     }
                 });
+        }
+
+        if plot_rendered {
+            self.plot_needs_reset = false;
+        }
+        if close_clicked || (self.selected_item.is_some() && selected_row.is_none()) {
+            self.clear_selection();
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -669,8 +850,17 @@ impl eframe::App for RS3App {
                             .size(24.0)
                             .color(Color32::from_rgb(200, 180, 140)));
                         ui.add_space(10.0);
-                        ui.label(RichText::new("Click 'Scan Market' to begin analyzing flips")
-                            .color(Color32::from_rgb(180, 160, 120)));
+                        if loading {
+                            ui.spinner();
+                            ui.label(RichText::new("Scanning market...")
+                                .color(Color32::from_rgb(180, 160, 120)));
+                        } else if self.status_is_error && !self.status.is_empty() {
+                            ui.label(RichText::new(&self.status)
+                                .color(Color32::from_rgb(255, 120, 100)));
+                        } else {
+                            ui.label(RichText::new("Click 'Scan Market' to begin analyzing flips")
+                                .color(Color32::from_rgb(180, 160, 120)));
+                        }
                     });
                 });
                 return;
@@ -700,6 +890,7 @@ impl eframe::App for RS3App {
             use std::rc::Rc;
             let favorite_toggles = Rc::new(RefCell::new(Vec::new()));
             let toggles_clone = favorite_toggles.clone();
+            let mut clicked_item: Option<i32> = None;
 
             TableBuilder::new(ui)
                 .striped(true)
@@ -775,7 +966,7 @@ impl eframe::App for RS3App {
                         let i = row.index();
                         let r = &self.filtered_items[i];
                         
-                        let is_selected = self.selected_row == Some(i);
+                        let is_selected = self.selected_item == Some(r.item_id);
                         let is_favorite = self.favorites.get(&r.name).copied().unwrap_or(false);
                         let item_name = r.name.clone();
 
@@ -802,18 +993,7 @@ impl eframe::App for RS3App {
                                 text = text.color(Color32::from_rgb(255, 200, 100));
                             }
                             if ui.selectable_label(is_selected, text).clicked() {
-                                if is_selected {
-                                    self.selected_row = None;
-                                    self.target_graph_height = 0.0;
-                                } else {
-                                    self.selected_row = Some(i);
-                                    self.target_graph_height = 300.0;
-                                    // Always reload history when selecting an item
-                                    self.selected_item_history.clear();
-                                    if let Ok(history) = load_item_history("rs3_market.db", &r.name) {
-                                        self.selected_item_history = history;
-                                    }
-                                }
+                                clicked_item = Some(r.item_id);
                             }
                         });
 
@@ -849,17 +1029,7 @@ impl eframe::App for RS3App {
                                         .on_hover_text(tier_name);
                                     
                                     // Trend indicator with clear text label
-                                    let (trend_text, trend_color) = if r.trend > 5.0 {
-                                        ("↑↑", Color32::from_rgb(100, 255, 100))
-                                    } else if r.trend > 1.0 {
-                                        ("↑", Color32::from_rgb(150, 255, 150))
-                                    } else if r.trend < -5.0 {
-                                        ("↓↓", Color32::from_rgb(255, 100, 100))
-                                    } else if r.trend < -1.0 {
-                                        ("↓", Color32::from_rgb(255, 150, 150))
-                                    } else {
-                                        ("→", Color32::from_rgb(200, 200, 200))
-                                    };
+                                    let (trend_text, _, trend_color) = trend_indicator(r.trend);
                                     ui.label(RichText::new(trend_text).color(trend_color).strong());
                                 });
                             });
@@ -900,8 +1070,14 @@ impl eframe::App for RS3App {
 
                         // Quantity
                         row.col(|ui| {
-                            ui.label(RichText::new(r.qty.to_string())
-                                .color(Color32::from_rgb(200, 200, 200)));
+                            // "?" = GE limit unknown, qty is not capped by a limit
+                            let (qty_text, limit_text) = match r.ge_limit {
+                                Some(limit) => (r.qty.to_string(), format!("GE limit: {}", limit)),
+                                None => (format!("{}?", r.qty), "GE limit: ? (unknown, qty not capped)".to_string()),
+                            };
+                            ui.label(RichText::new(qty_text)
+                                .color(Color32::from_rgb(200, 200, 200)))
+                                .on_hover_text(limit_text);
                         });
 
                         // Avg Volume/Day
@@ -959,20 +1135,11 @@ impl eframe::App for RS3App {
                         // Copy button
                         row.col(|ui| {
                             if ui.button("📋").on_hover_text("Copy item details").clicked() {
-                                let (trend_text, _) = if r.trend > 5.0 {
-                                    ("Rising++", Color32::from_rgb(100, 255, 100))
-                                } else if r.trend > 1.0 {
-                                    ("Rising+", Color32::from_rgb(150, 255, 150))
-                                } else if r.trend < -5.0 {
-                                    ("Falling--", Color32::from_rgb(255, 100, 100))
-                                } else if r.trend < -1.0 {
-                                    ("Falling-", Color32::from_rgb(255, 150, 150))
-                                } else {
-                                    ("Stable", Color32::from_rgb(200, 200, 200))
-                                };
-                                
+                                let (_, trend_text, _) = trend_indicator(r.trend);
+                                let limit_note = if r.ge_limit.is_none() { " (GE limit ?)" } else { "" };
+
                                 let copy_text = format!(
-                                    "{}:\nScore: {}\nTier: {} {}\nBuy: {}\nSell: {}\nQty: {}\nAvg Vol: {}\nTotal cost: {}\nProfit: {}\nROI: {:.1}%",
+                                    "{}:\nScore: {}\nTier: {} {}\nBuy: {}\nSell: {}\nQty: {}{}\nAvg Vol: {}\nTotal cost: {}\nProfit: {}\nROI: {:.1}%",
                                     r.name,
                                     r.score,
                                     r.tier,
@@ -980,6 +1147,7 @@ impl eframe::App for RS3App {
                                     format_gp(r.buy),
                                     format_gp(r.sell as f64),
                                     r.qty,
+                                    limit_note,
                                     r.avg_volume,
                                     format_gp(r.total_cost),
                                     format_gp(r.profit),
@@ -1000,14 +1168,42 @@ impl eframe::App for RS3App {
             }
             if !toggles.is_empty() {
                 self.save_favorites();
+                self.apply_filters();
+            }
+
+            if let Some(id) = clicked_item {
+                if self.selected_item == Some(id) {
+                    self.clear_selection();
+                } else {
+                    self.select_item(id);
+                }
             }
         });
 
-        ui.ctx().request_repaint();
+        // Only keep repainting while something is changing on its own
+        // (checked at end of frame so a selection made this frame starts the animation)
+        let animating = self.graph_height != self.target_graph_height;
+        if animating || self.load_rx.is_some() {
+            ui.ctx().request_repaint();
+        }
     }
 }
 
-fn format_gp(value: f64) -> String {
+// Date label for an integer x within the history; None for fractional or out-of-range x
+fn history_date(history: &[(String, f64)], x: f64) -> Option<&String> {
+    let idx = x.round();
+    if idx >= 0.0 && (x - idx).abs() < 1e-6 {
+        history.get(idx as usize).map(|(date, _)| date)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn format_gp(value: f64) -> String {
+    if value < 0.0 {
+        let s = format_gp(-value);
+        return if s == "0" { s } else { format!("-{}", s) };
+    }
     if value >= 1_000_000_000.0 {
         format!("{:.2}B", value / 1_000_000_000.0)
     } else if value >= 1_000_000.0 {

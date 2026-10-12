@@ -1,7 +1,17 @@
 use crate::model::ItemStats;
 use crate::model::FlipResult;
 
-pub fn analyze(stats: &ItemStats, tax: f64) -> FlipResult {
+/// RS3 GE tax per item: 2% of the sale price, rounded down per item, no cap.
+/// Bonds are exempt; items under 50gp therefore pay nothing.
+pub fn ge_tax(price_per_item: i32, item_name: &str) -> i32 {
+    if item_name == "Bond" {
+        0
+    } else {
+        price_per_item.max(0) / 50  // == floor(2%), without i32 overflow
+    }
+}
+
+pub fn analyze(stats: &ItemStats) -> FlipResult {
     if stats.prices.is_empty() {
         return FlipResult::empty();
     }
@@ -56,32 +66,27 @@ pub fn analyze(stats: &ItemStats, tax: f64) -> FlipResult {
     };
     
     let mut prices = analysis_prices;
-    prices.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    prices.sort_by(f64::total_cmp);
 
     let q05 = quantile(&prices, 0.05);
-    let q10 = quantile(&prices, 0.10);
-    let q15 = quantile(&prices, 0.15);
-    let _q25 = quantile(&prices, 0.25);
     let q50 = quantile(&prices, 0.50);
-    let _q75 = quantile(&prices, 0.75);
-    let q85 = quantile(&prices, 0.85);
-    let q90 = quantile(&prices, 0.90);
     let q95 = quantile(&prices, 0.95);
 
-    // Use more conservative percentiles for crashed/spiked items
-    let (buy, sell) = if use_recent {
-        // For crashed items, use tighter range (Q15-Q85) to avoid old extremes
-        (q15.round() as i32, q85.round() as i32)
-    } else {
-        // Normal items use standard Q10-Q90
-        (q10.round() as i32, q90.round() as i32)
-    };
+    // Use more conservative percentiles for crashed/spiked items:
+    // crashed/spiked items use a tighter range (Q15-Q85) to avoid old extremes,
+    // normal items use the standard Q10-Q90.
+    // The same pair drives buy/sell, volatility and the spread penalty so they all
+    // describe the same price band.
+    let (lo_q, hi_q) = if use_recent { (0.15, 0.85) } else { (0.10, 0.90) };
+    let lo = quantile(&prices, lo_q);
+    let hi = quantile(&prices, hi_q);
+    let (buy, sell) = (lo.round() as i32, hi.round() as i32);
 
-    let price_range = q90 - q10;
+    let price_range = hi - lo;
     let volatility = if q50 > 0.0 { (price_range / q50) * 100.0 } else { 0.0 };
 
     let gross = (sell - buy) as f64;
-    let tax_loss = sell as f64 * tax;
+    let tax_loss = ge_tax(sell, &stats.name) as f64;
     let net = gross - tax_loss;
 
     let roi = if buy > 0 { (net / buy as f64) * 100.0 } else { 0.0 };
@@ -99,10 +104,10 @@ pub fn analyze(stats: &ItemStats, tax: f64) -> FlipResult {
         "NORMAL".to_string()
     };
 
-    let roi_score = (roi * 2.0).max(i32::MIN as f64).min(i32::MAX as f64) as i32;
-    
+    let roi_score = (roi * 2.0).clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+
     let volume_score = if stats.avg_volume > 0.0 {
-        (stats.avg_volume.log10() * 15.0).max(0.0).min(100.0) as i32
+        (stats.avg_volume.log10() * 15.0).clamp(0.0, 100.0) as i32
     } else {
         0
     };
@@ -124,11 +129,8 @@ pub fn analyze(stats: &ItemStats, tax: f64) -> FlipResult {
         0
     };
     
-    let trend_score = if stats.price_trend > 0.0 {
-        (stats.price_trend.min(50.0) / 2.0) as i32
-    } else {
-        (stats.price_trend.max(-50.0) / 2.0) as i32
-    };
+    // price_trend is % per sample; saturates at +/-2% (twice the strong-trend threshold) -> +/-25
+    let trend_score = (stats.price_trend.clamp(-2.0, 2.0) * 12.5) as i32;
 
     // Penalize if many outliers were removed (indicates unstable price)
     let outlier_penalty = if stats.outliers_removed > (stats.data_points / 5) {
@@ -183,8 +185,7 @@ pub fn analyze(stats: &ItemStats, tax: f64) -> FlipResult {
         tier,
         buy,
         sell,
-        qty: 1,
-        profit: net.round() as i32,
+        profit: net,
         roi,
         avg_volume: stats.avg_volume,
         notes: format!(
@@ -199,7 +200,7 @@ pub fn analyze(stats: &ItemStats, tax: f64) -> FlipResult {
     }
 }
 
-fn quantile(v: &Vec<f64>, q: f64) -> f64 {
+fn quantile(v: &[f64], q: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
     }

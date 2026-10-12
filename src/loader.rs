@@ -1,9 +1,39 @@
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OpenFlags, Result};
 use crate::model::ItemSnapshot;
 
-pub fn load_snapshots(db_path: &str) -> Result<Vec<ItemSnapshot>> {
-    let conn = Connection::open(db_path)?;
-    
+// Read-only: never create an empty database when the file is missing
+fn open_db(db_path: &str) -> Result<Connection> {
+    Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+    )
+}
+
+// Keep good rows, count and report bad ones instead of silently dropping them
+fn collect_rows<T>(rows: impl Iterator<Item = Result<T>>, what: &str) -> (Vec<T>, usize) {
+    let mut out = Vec::new();
+    let mut errors = 0;
+    for row in rows {
+        match row {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                if errors == 0 {
+                    eprintln!("{}: skipping unreadable row: {}", what, e);
+                }
+                errors += 1;
+            }
+        }
+    }
+    if errors > 0 {
+        eprintln!("{}: {} row(s) skipped due to read errors", what, errors);
+    }
+    (out, errors)
+}
+
+/// Returns the snapshots and the number of rows skipped due to read errors.
+pub fn load_snapshots(db_path: &str) -> Result<(Vec<ItemSnapshot>, usize)> {
+    let conn = open_db(db_path)?;
+
     let mut stmt = conn.prepare(
         "SELECT i.id, i.name, i.ge_limit, h.record_date,
                 h.price, h.volume
@@ -20,28 +50,27 @@ pub fn load_snapshots(db_path: &str) -> Result<Vec<ItemSnapshot>> {
             ge_limit: row.get(2)?,
             record_date: row.get(3)?,
             price: row.get(4)?,
-            volume: row.get(5)?,
+            volume: row.get::<_, Option<i32>>(5)?.unwrap_or(0),
         })
     })?;
 
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(collect_rows(rows, "load_snapshots"))
 }
 
-pub fn load_item_history(db_path: &str, item_name: &str) -> Result<Vec<(String, f64)>> {
-    let conn = Connection::open(db_path)?;
-    
+pub fn load_item_history(db_path: &str, item_id: i32) -> Result<Vec<(String, f64)>> {
+    let conn = open_db(db_path)?;
+
     let mut stmt = conn.prepare(
         "SELECT h.record_date, h.price
          FROM history h
-         JOIN items i ON h.item_id = i.id
-         WHERE i.name = ?1
+         WHERE h.item_id = ?1
          AND h.record_date >= date('now', '-365 days')
          ORDER BY h.record_date"
     )?;
 
-    let rows = stmt.query_map([item_name], |row| {
+    let rows = stmt.query_map([item_id], |row| {
         Ok((row.get(0)?, row.get::<_, i32>(1)? as f64))
     })?;
 
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(collect_rows(rows, "load_item_history").0)
 }

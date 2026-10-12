@@ -2,6 +2,8 @@ use statrs::statistics::Statistics;
 use crate::model::{ItemSnapshot, ItemStats};
 use std::collections::HashMap;
 
+const RECENT_DAYS: i64 = 14;
+
 pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
     let mut map: HashMap<i32, Vec<&ItemSnapshot>> = HashMap::new();
 
@@ -12,41 +14,34 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
     let mut results = Vec::new();
 
     for (id, records) in map {
-        let mut prices: Vec<f64> = records.iter().map(|x| x.price as f64).collect();
+        // Records arrive in chronological order (ORDER BY record_date)
+        let chrono_prices: Vec<f64> = records.iter().map(|x| x.price as f64).collect();
         let volumes: Vec<f64> = records.iter().map(|x| x.volume as f64).collect();
+
+        let current = records.last().unwrap();
 
         // Get recent prices (last 14 days) for time-weighted analysis
         // Using 14 days instead of 30 to catch rapid crashes/spikes
-        let recent_cutoff = if records.len() >= 14 {
-            records.len() - 14
-        } else {
-            0
+        let recent_cutoff = match day_number(&current.record_date) {
+            Some(latest) => records
+                .iter()
+                .position(|x| day_number(&x.record_date).is_some_and(|d| latest - d < RECENT_DAYS))
+                .unwrap_or(records.len()),
+            None => records.len().saturating_sub(RECENT_DAYS as usize),
         };
-        let recent_prices_chrono: Vec<f64> = records[recent_cutoff..]
-            .iter()
-            .map(|x| x.price as f64)
-            .collect();
+        let recent_prices_chrono: Vec<f64> = chrono_prices[recent_cutoff..].to_vec();
         let mut recent_prices = recent_prices_chrono.clone();
-        recent_prices.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        recent_prices.sort_by(f64::total_cmp);
 
-        prices.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut prices = chrono_prices.clone();
+        prices.sort_by(f64::total_cmp);
 
-        let current = records.last().unwrap();
-        let prev = if records.len() > 1 {
-            records[records.len() - 2].price as f64
-        } else {
-            current.price as f64
-        };
+        // Remove outliers using IQR method (removes DXP/update spikes), keeping chronological order
+        let (filtered_prices, outliers_removed) = remove_outliers(&chrono_prices);
 
-        let std_dev = prices.clone().std_dev();
-
-        // Remove outliers using IQR method (removes DXP/update spikes)
-        let (filtered_prices, outliers_removed) = remove_outliers(&prices);
-        
+        // remove_outliers falls back to the full series, so this is never sparser than the raw data
         let price_trend = if filtered_prices.len() >= 3 {
             calculate_trend(&filtered_prices)
-        } else if prices.len() >= 3 {
-            calculate_trend(&prices)
         } else {
             0.0
         };
@@ -55,20 +50,11 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
             item_id: id,
             name: current.name.clone(),
 
-            current_price: *prices.last().unwrap(),
-            prev_price: prev,
-
             avg_volume: volumes.mean(),
-            std_dev,
-
-            q10: quantile(&prices, 0.10),
-            q50: quantile(&prices, 0.50),
-            q90: quantile(&prices, 0.90),
 
             data_points: prices.len(),
             ge_limit: current.ge_limit,
-            current_volume: current.volume as f64,
-            prices: prices.clone(),
+            prices,
             price_trend,
             filtered_prices,
             outliers_removed,
@@ -83,34 +69,50 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
 }
 
 
-fn quantile(sorted: &Vec<f64>, q: f64) -> f64 {
+// Days since 1970-01-01 for an ISO "yyyy-mm-dd" date (proleptic Gregorian)
+fn day_number(date: &str) -> Option<i64> {
+    let y: i64 = date.get(0..4)?.parse().ok()?;
+    let m: i64 = date.get(5..7)?.parse().ok()?;
+    let d: i64 = date.get(8..10)?.parse().ok()?;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn quantile(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() { return 0.0; }
     let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
     sorted[idx]
 }
 
 // Remove outliers using IQR method (filters DXP/update spikes)
+// Input and output are chronological; only the bounds use a sorted copy
 fn remove_outliers(prices: &[f64]) -> (Vec<f64>, usize) {
     if prices.len() < 10 {
         return (prices.to_vec(), 0);
     }
-    
-    let q1 = quantile(&prices.to_vec(), 0.25);
-    let q3 = quantile(&prices.to_vec(), 0.75);
+
+    let mut sorted = prices.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let q1 = quantile(&sorted, 0.25);
+    let q3 = quantile(&sorted, 0.75);
     let iqr = q3 - q1;
-    
+
     // Use 1.5 * IQR for outlier detection (standard method)
     let lower_bound = q1 - (1.5 * iqr);
     let upper_bound = q3 + (1.5 * iqr);
-    
+
     let original_len = prices.len();
     let filtered: Vec<f64> = prices.iter()
         .copied()
         .filter(|&p| p >= lower_bound && p <= upper_bound)
         .collect();
-    
+
     let removed = original_len - filtered.len();
-    
+
     // Return original if we filtered too much (>30%)
     if filtered.len() < (original_len * 7 / 10) {
         (prices.to_vec(), 0)
@@ -119,24 +121,26 @@ fn remove_outliers(prices: &[f64]) -> (Vec<f64>, usize) {
     }
 }
 
+// Linear regression slope over a chronological series, relative to its mean:
+// % price change per sample (positive = rising, negative = falling)
 fn calculate_trend(prices: &[f64]) -> f64 {
     let n = prices.len() as f64;
     if n < 2.0 { return 0.0; }
-    
+
     let x_mean = (n - 1.0) / 2.0;
     let y_mean = prices.iter().sum::<f64>() / n;
-    
+
     let mut numerator = 0.0;
     let mut denominator = 0.0;
-    
+
     for (i, &price) in prices.iter().enumerate() {
         let x_diff = i as f64 - x_mean;
         numerator += x_diff * (price - y_mean);
         denominator += x_diff * x_diff;
     }
-    
-    if denominator != 0.0 {
-        numerator / denominator
+
+    if denominator != 0.0 && y_mean != 0.0 {
+        numerator / denominator / y_mean * 100.0
     } else {
         0.0
     }

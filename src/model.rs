@@ -1,10 +1,8 @@
-use serde::{Serialize, Deserialize};
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct ItemSnapshot {
     pub item_id: i32,
     pub name: String,
-    pub ge_limit: i32,
+    pub ge_limit: Option<i32>,  // None = unknown limit
     pub record_date: String,
     pub price: i32,
     pub volume: i32,
@@ -14,26 +12,17 @@ pub struct ItemStats {
     pub item_id: i32,
     pub name: String,
 
-    pub current_price: f64,
-    pub prev_price: f64,
-
     pub avg_volume: f64,
-    pub std_dev: f64,
-
-    pub q10: f64,
-    pub q50: f64,
-    pub q90: f64,
 
     pub data_points: usize,
-    pub ge_limit: i32,
+    pub ge_limit: Option<i32>,  // None = unknown limit
 
-    pub current_volume: f64,
-    pub prices: Vec<f64>,
-    pub price_trend: f64,  // Positive = rising, negative = falling
-    pub filtered_prices: Vec<f64>,  // Prices with outliers removed
+    pub prices: Vec<f64>,  // Sorted ascending
+    pub price_trend: f64,  // % change per sample; positive = rising, negative = falling
+    pub filtered_prices: Vec<f64>,  // Prices with outliers removed (chronological)
     pub outliers_removed: usize,
-    pub recent_prices: Vec<f64>,  // Last 14 records (sorted) for time-weighted analysis
-    pub recent_prices_chrono: Vec<f64>,  // Last 14 records in chronological order
+    pub recent_prices: Vec<f64>,  // Last 14 days of records (sorted) for time-weighted analysis
+    pub recent_prices_chrono: Vec<f64>,  // Last 14 days of records in chronological order
 }
 
 
@@ -45,8 +34,7 @@ pub struct FlipResult {
     pub buy: i32,
     pub sell: i32,
 
-    pub qty: i32,
-    pub profit: i32,
+    pub profit: f64,  // Net profit per item after GE tax
     pub roi: f64,
     pub avg_volume: f64,
 
@@ -60,8 +48,7 @@ impl FlipResult {
             tier: "NONE".to_string(),
             buy: 0,
             sell: 0,
-            qty: 0,
-            profit: 0,
+            profit: 0.0,
             roi: 0.0,
             avg_volume: 0.0,
             notes: String::new(),
