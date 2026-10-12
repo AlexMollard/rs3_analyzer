@@ -5,10 +5,16 @@
 
 # Database
 rs3_market.db
+rs3_market.db.gz
 *.db-journal
+*.db-wal
+*.db-shm
+*.tmp
 
 # Application state
 favorites.json
+favorites.json.bak
+favorites.json.tmp
 
 # IDE
 .vscode/
@@ -23,3 +29,4 @@ Thumbs.db
 
 # Logs
 *.log
+collector_log.txt
