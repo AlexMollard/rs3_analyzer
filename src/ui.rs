@@ -4,7 +4,7 @@ use egui::{
     Color32, Context, FontFamily, FontId, Margin, RichText, Visuals, Stroke, Vec2
 };
 use egui_extras::{Column, TableBuilder};
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{HoverPosition, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 
 pub fn set_custom_style(ctx: &Context) {
@@ -34,7 +34,7 @@ pub fn set_custom_style(ctx: &Context) {
     ctx.set_visuals(visuals);
 
     // RS3 fonts + spacing
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
 
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.window_margin = Margin::same(12);
@@ -58,7 +58,7 @@ pub fn set_custom_style(ctx: &Context) {
         FontId::new(14.0, FontFamily::Monospace),
     );
 
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 #[derive(Clone)]
@@ -326,8 +326,8 @@ impl RS3App {
 }
 
 impl eframe::App for RS3App {
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             
             // Title bar with RS3 styling
@@ -395,10 +395,10 @@ impl eframe::App for RS3App {
         });
 
         if self.loaded {
-            egui::SidePanel::right("filters")
-                .min_width(250.0)
-                .max_width(350.0)
-                .show(ctx, |ui| {
+            egui::Panel::right("filters")
+                .min_size(250.0)
+                .max_size(350.0)
+                .show(ui, |ui| {
                     ui.heading(RichText::new("⚡ Filters & Settings")
                         .color(Color32::from_rgb(255, 210, 100)));
                     
@@ -543,7 +543,119 @@ impl eframe::App for RS3App {
                 });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        self.graph_height += (self.target_graph_height - self.graph_height) * 0.2;
+        if (self.target_graph_height - self.graph_height).abs() < 0.5 {
+            self.graph_height = self.target_graph_height;
+        }
+
+        if self.graph_height > 1.0 {
+            egui::Panel::bottom("graph_panel")
+                .min_size(self.graph_height)
+                .max_size(self.graph_height)
+                .show(ui, |ui| {
+                    if let Some(idx) = self.selected_row {
+                        if let Some(r) = self.filtered_items.get(idx) {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(35, 28, 18))
+                                .stroke(Stroke::new(2.0, Color32::from_rgb(100, 80, 50)))
+                                .inner_margin(Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("⎘ Price History:")
+                                            .color(Color32::from_rgb(255, 210, 100))
+                                            .strong()
+                                            .size(16.0));
+                                        
+                                        ui.label(RichText::new(&r.name)
+                                            .color(Color32::from_rgb(255, 220, 150))
+                                            .size(16.0));
+                                        
+                                        ui.separator();
+                                        
+                                        ui.label(RichText::new(&r.notes)
+                                            .color(Color32::from_rgb(180, 160, 120))
+                                            .italics());
+
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.button(RichText::new("✖").size(16.0)).clicked() {
+                                                self.selected_row = None;
+                                                self.target_graph_height = 0.0;
+                                                self.selected_item_history.clear();
+                                            }
+                                        });
+                                    });
+                                    
+                                    if !self.selected_item_history.is_empty() {
+                                        ui.add_space(5.0);
+                                        
+                                        let points: PlotPoints = self.selected_item_history
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, (_, price))| [i as f64, *price])
+                                            .collect();
+                                        
+                                        let line = Line::new("Price", points)
+                                            .color(Color32::from_rgb(100, 200, 255))
+                                            .width(2.0);
+                                        
+                                        // Calculate Y-axis range to handle negative values
+                                        let prices: Vec<f64> = self.selected_item_history.iter().map(|(_, p)| *p).collect();
+                                        let min_price = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+                                        let max_price = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                                        let padding = (max_price - min_price) * 0.1;
+                                        
+                                        let history_clone = self.selected_item_history.clone();
+                                        Plot::new("price_history")
+                                            .height(self.graph_height - 80.0)
+                                            .show_axes(true)
+                                            .show_grid(true)
+                                            .allow_zoom(true)
+                                            .allow_scroll(true)
+                                            .allow_drag(true)
+                                            .reset()  // Reset view when plot is recreated
+                                            .include_y(min_price - padding)
+                                            .include_y(max_price + padding)
+                                            .x_axis_formatter(move |mark, _range| {
+                                                let idx = mark.value as usize;
+                                                if let Some((date, _)) = history_clone.get(idx) {
+                                                    if date.len() >= 10 {
+                                                        date[5..10].to_string()
+                                                    } else {
+                                                        date.clone()
+                                                    }
+                                                } else {
+                                                    String::new()
+                                                }
+                                            })
+                                            .label_formatter(|pos| {
+                                                let value = match pos {
+                                                    HoverPosition::NearDataPoint { position, .. }
+                                                    | HoverPosition::Elsewhere { position } => position,
+                                                };
+                                                Some(if let Some((date, _)) = self.selected_item_history.get(value.x as usize) {
+                                                    format!("{}\nPrice: {}", date, format_gp(value.y))
+                                                } else {
+                                                    format!("Price: {}", format_gp(value.y))
+                                                })
+                                            })
+                                            .show(ui, |plot_ui| {
+                                                plot_ui.line(line);
+                                            });
+                                    } else {
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label(RichText::new("Loading price history...")
+                                                .color(Color32::from_rgb(180, 160, 120))
+                                                .italics()
+                                                .size(18.0));
+                                        });
+                                    }
+                                });
+                        }
+                    }
+                });
+        }
+
+        egui::CentralPanel::default().show(ui, |ui| {
 
             if !self.loaded {
                 ui.centered_and_justified(|ui| {
@@ -891,115 +1003,7 @@ impl eframe::App for RS3App {
             }
         });
 
-        self.graph_height += (self.target_graph_height - self.graph_height) * 0.2;
-        if (self.target_graph_height - self.graph_height).abs() < 0.5 {
-            self.graph_height = self.target_graph_height;
-        }
-
-        if self.graph_height > 1.0 {
-            egui::TopBottomPanel::bottom("graph_panel")
-                .min_height(self.graph_height)
-                .max_height(self.graph_height)
-                .show(ctx, |ui| {
-                    if let Some(idx) = self.selected_row {
-                        if let Some(r) = self.filtered_items.get(idx) {
-                            egui::Frame::new()
-                                .fill(Color32::from_rgb(35, 28, 18))
-                                .stroke(Stroke::new(2.0, Color32::from_rgb(100, 80, 50)))
-                                .inner_margin(Margin::same(12))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("⎘ Price History:")
-                                            .color(Color32::from_rgb(255, 210, 100))
-                                            .strong()
-                                            .size(16.0));
-                                        
-                                        ui.label(RichText::new(&r.name)
-                                            .color(Color32::from_rgb(255, 220, 150))
-                                            .size(16.0));
-                                        
-                                        ui.separator();
-                                        
-                                        ui.label(RichText::new(&r.notes)
-                                            .color(Color32::from_rgb(180, 160, 120))
-                                            .italics());
-
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if ui.button(RichText::new("✖").size(16.0)).clicked() {
-                                                self.selected_row = None;
-                                                self.target_graph_height = 0.0;
-                                                self.selected_item_history.clear();
-                                            }
-                                        });
-                                    });
-                                    
-                                    if !self.selected_item_history.is_empty() {
-                                        ui.add_space(5.0);
-                                        
-                                        let points: PlotPoints = self.selected_item_history
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, (_, price))| [i as f64, *price])
-                                            .collect();
-                                        
-                                        let line = Line::new("Price", points)
-                                            .color(Color32::from_rgb(100, 200, 255))
-                                            .width(2.0);
-                                        
-                                        // Calculate Y-axis range to handle negative values
-                                        let prices: Vec<f64> = self.selected_item_history.iter().map(|(_, p)| *p).collect();
-                                        let min_price = prices.iter().cloned().fold(f64::INFINITY, f64::min);
-                                        let max_price = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                                        let padding = (max_price - min_price) * 0.1;
-                                        
-                                        let history_clone = self.selected_item_history.clone();
-                                        Plot::new("price_history")
-                                            .height(self.graph_height - 80.0)
-                                            .show_axes(true)
-                                            .show_grid(true)
-                                            .allow_zoom(true)
-                                            .allow_scroll(true)
-                                            .allow_drag(true)
-                                            .reset()  // Reset view when plot is recreated
-                                            .include_y(min_price - padding)
-                                            .include_y(max_price + padding)
-                                            .x_axis_formatter(move |mark, _range| {
-                                                let idx = mark.value as usize;
-                                                if let Some((date, _)) = history_clone.get(idx) {
-                                                    if date.len() >= 10 {
-                                                        date[5..10].to_string()
-                                                    } else {
-                                                        date.clone()
-                                                    }
-                                                } else {
-                                                    String::new()
-                                                }
-                                            })
-                                            .label_formatter(|_name, value| {
-                                                if let Some((date, _)) = self.selected_item_history.get(value.x as usize) {
-                                                    format!("{}\nPrice: {}", date, format_gp(value.y))
-                                                } else {
-                                                    format!("Price: {}", format_gp(value.y))
-                                                }
-                                            })
-                                            .show(ui, |plot_ui| {
-                                                plot_ui.line(line);
-                                            });
-                                    } else {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(RichText::new("Loading price history...")
-                                                .color(Color32::from_rgb(180, 160, 120))
-                                                .italics()
-                                                .size(18.0));
-                                        });
-                                    }
-                                });
-                        }
-                    }
-                });
-        }
-
-        ctx.request_repaint();
+        ui.ctx().request_repaint();
     }
 }
 
