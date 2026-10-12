@@ -1,7 +1,15 @@
 # Rust
 /target/
+/src-tauri/target/
 **/*.rs.bk
 *.pdb
+
+# Tauri (generated capability schemas)
+/src-tauri/gen/schemas/
+
+# Frontend
+node_modules/
+/dist/
 
 # Database
 rs3_market.db

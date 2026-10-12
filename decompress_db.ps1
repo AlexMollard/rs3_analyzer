@@ -56,4 +56,4 @@ $size = (Get-Item -LiteralPath $dbFile).Length / 1MB
 Write-Host "Decompression complete!"
 Write-Host "Database size: $([math]::Round($size, 2)) MB"
 Write-Host "SHA256: $((Get-FileHash -LiteralPath $dbFile -Algorithm SHA256).Hash)"
-Write-Host "You can now run the application with: cargo run --release"
+Write-Host "You can now run the application with: pnpm tauri dev"

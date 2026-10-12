@@ -6,19 +6,28 @@ A desktop application for analyzing RuneScape 3 Grand Exchange market data to id
 
 - **Advanced Flip Analysis**: Multi-factor scoring system that evaluates ROI, trading volume, profit margins, price trends, and data reliability
 - **Smart Filtering**: Automatically filters out unrealistic flips with low volume, extreme ROI, or suspicious pricing
-- **Tier System**: Items categorized as Diamond, Gold, Good, Normal, or Crash based on profitability
-- **Price Trends**: Real-time trend indicators showing Rising++, Rising+, Stable, Falling-, and Falling-- price movements
-- **Persistent Favorites**: Save your favorite flips across sessions
-- **Customizable Filters**: Filter by tier, minimum profit, ROI, budget, and search terms
-- **Modern RS3 UI**: Dark brown/gold theme inspired by the Grand Exchange interface
+- **Tier System**: Items ranked S, A, B or C by profitability, plus a Crash tier for flips that lose money after tax
+- **Risk Detection**: Flags items that are crashing, have crashed, have spiked, or had outliers removed
+- **Price Trends**: Trend indicators showing Rising++, Rising+, Stable, Falling-, and Falling-- price movements
+- **Trading Desk**: Sortable, virtualized flip table with a detail panel (interactive price chart, buy/sell/tax/trend, risk notes, copy-to-clipboard summary)
+- **Watchlist**: Favourites shown as cards with sparklines and total profit at your budget
+- **Customizable Filters**: Filter by tier, minimum profit, ROI, daily volume, budget, and search terms
+- **Neutral stone UI**: Dark RuneScape-inspired theme, bundled fonts, keyboard navigation
 
 ## Requirements
 
-- Rust 1.85 or later (the crate uses the 2024 edition)
+- Rust 1.90 or later (the crate uses the 2024 edition; Tauri 2.12 needs 1.90)
+- Node.js 22 and pnpm 10 (for the frontend)
+- Microsoft Edge WebView2 Runtime (preinstalled on Windows 10/11)
 - Python 3 with `requests` (only for collecting/rebuilding the database)
-- Windows (for Segoe UI font support)
 
-The UI is built with egui/eframe 0.36 and reads the data with `rusqlite` (bundled SQLite).
+The app is built with [Tauri 2](https://v2.tauri.app/): a Svelte 5 + TypeScript frontend (Vite, uPlot for charts) over a Rust core that reads the data with `rusqlite` (bundled SQLite).
+
+### Project layout
+
+- `src-tauri/` - Rust: Tauri commands (`lib.rs`, `commands.rs`), favourites store (`favorites.rs`) and the analysis core (`loader.rs`, `stats.rs`, `flips.rs`, `model.rs`)
+- `ui/` - Svelte frontend (`App.svelte`, `components/`, `lib/`)
+- `index.html`, `vite.config.ts`, `package.json` - frontend build
 
 ## Installation
 
@@ -30,14 +39,32 @@ cd rs3_analyzer
 
 2. Get a database (see [Database](#database)). The database is **not stored in git**.
 
-3. Build and run:
+3. Install the frontend dependencies and run the app in development mode:
 ```bash
-cargo run --release
+pnpm install
+pnpm tauri dev
+```
+
+4. Build a release executable (and installers):
+```bash
+pnpm tauri build
+```
+The executable is written to `src-tauri/target/release/`. Use `pnpm tauri build --no-bundle` to skip the installers.
+
+### Checks
+
+Build the frontend first: the Rust crate embeds `dist/` at compile time, so `cargo` fails on a fresh clone until it exists.
+
+```bash
+pnpm install
+pnpm build    # production frontend build (creates dist/)
+pnpm check    # svelte-check + the gp formatting parity check
+cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings
 ```
 
 ## Database
 
-The application expects a SQLite database named `rs3_market.db` in the project directory. It is not stored in git (it is large and gitignored), so you either rebuild it locally or receive a snapshot from someone who has one.
+The application expects a SQLite database named `rs3_market.db`. It looks in the current directory first, then next to the executable (development builds also check the repository root, since `pnpm tauri dev` runs from `src-tauri/`). The database is opened read-only. If it is missing, the app lists the paths it searched and how to get the data. It is not stored in git (it is large and gitignored), so you either rebuild it locally or receive a snapshot from someone who has one.
 
 ### Schema
 
@@ -87,17 +114,18 @@ Both write to a temporary file and only replace the target when the operation su
 
 ## Usage
 
-1. **Scan Market**: Click the "Scan Market" button to load and analyze data from your database
-2. **Set Budget**: Adjust your available GP budget using the slider
-3. **Filter Results**: Use the side panel to filter by tier, minimum profit, ROI, or search for specific items
-4. **Sort Data**: Click column headers or use the sort dropdown to organize results
-5. **Mark Favorites**: Click the star button to save items to your favorites list (stored in `favorites.json`)
-6. **Copy Details**: Click the clipboard button to copy flip details to your clipboard
+1. **Scan Market**: The app scans on startup; click "Scan market" to rescan after the database changes
+2. **Set Budget**: Type your budget in the filter rail (`50m`, `1.5b` and `50,000,000` all work). Quantities and totals update instantly without rescanning
+3. **Filter Results**: Use the filter rail for tier, minimum profit, ROI and daily volume; press `/` to jump to search
+4. **Sort Data**: Click a column header to sort; click again to reverse
+5. **Inspect an Item**: Click a row (or use the arrow keys) to open the detail panel with the price chart: scroll to zoom, drag to pan
+6. **Mark Favourites**: Click a star. Favourites appear on the Watchlist tab and are stored in `favorites.json` in the app's config directory (`%APPDATA%\com.alexmollard.rs3analyzer` on Windows). A `favorites.json` from an older build in the current or executable directory is imported on first run
+7. **Copy Details**: Click "Copy flip summary" in the detail panel
 
 ## Filtering Logic
 
 The analyzer automatically filters out:
-- Items with less than 500 average daily volume (insufficient liquidity)
+- Items below the minimum average daily volume (500 by default, adjustable in the filter rail)
 - Items with ROI exceeding 150% (likely data anomalies)
 - Items with buy prices below 100gp (vendor trash/data errors)
 
@@ -115,6 +143,10 @@ The scoring system evaluates:
 - **Reliability Score**: Amount of historical data available
 - **Spread Penalty**: Penalizes tight spreads (<2%)
 - **Trend Score**: Bonus for rising prices, penalty for falling
+
+## Data attribution
+
+Price data from the RuneScape Wiki and Weird Gloop, CC BY-NC-SA 3.0.
 
 ## License
 

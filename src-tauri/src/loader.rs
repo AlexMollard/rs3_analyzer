@@ -1,8 +1,9 @@
 use rusqlite::{Connection, OpenFlags, Result};
 use crate::model::ItemSnapshot;
+use std::path::Path;
 
 // Read-only: never create an empty database when the file is missing
-fn open_db(db_path: &str) -> Result<Connection> {
+fn open_db(db_path: &Path) -> Result<Connection> {
     Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
@@ -31,8 +32,8 @@ fn collect_rows<T>(rows: impl Iterator<Item = Result<T>>, what: &str) -> (Vec<T>
 }
 
 /// Returns the snapshots and the number of rows skipped due to read errors.
-pub fn load_snapshots(db_path: &str) -> Result<(Vec<ItemSnapshot>, usize)> {
-    let conn = open_db(db_path)?;
+pub fn load_snapshots(db_path: impl AsRef<Path>) -> Result<(Vec<ItemSnapshot>, usize)> {
+    let conn = open_db(db_path.as_ref())?;
 
     let mut stmt = conn.prepare(
         "SELECT i.id, i.name, i.ge_limit, h.record_date,
@@ -57,11 +58,18 @@ pub fn load_snapshots(db_path: &str) -> Result<(Vec<ItemSnapshot>, usize)> {
     Ok(collect_rows(rows, "load_snapshots"))
 }
 
-pub fn load_item_history(db_path: &str, item_id: i32) -> Result<Vec<(String, f64)>> {
-    let conn = open_db(db_path)?;
+#[derive(serde::Serialize)]
+pub struct HistoryRow {
+    pub date: String,
+    pub price: i32,
+    pub volume: i32,  // 0 when unknown
+}
+
+pub fn load_item_history(db_path: impl AsRef<Path>, item_id: i32) -> Result<Vec<HistoryRow>> {
+    let conn = open_db(db_path.as_ref())?;
 
     let mut stmt = conn.prepare(
-        "SELECT h.record_date, h.price
+        "SELECT h.record_date, h.price, h.volume
          FROM history h
          WHERE h.item_id = ?1
          AND h.record_date >= date('now', '-365 days')
@@ -69,7 +77,11 @@ pub fn load_item_history(db_path: &str, item_id: i32) -> Result<Vec<(String, f64
     )?;
 
     let rows = stmt.query_map([item_id], |row| {
-        Ok((row.get(0)?, row.get::<_, i32>(1)? as f64))
+        Ok(HistoryRow {
+            date: row.get(0)?,
+            price: row.get(1)?,
+            volume: row.get::<_, Option<i32>>(2)?.unwrap_or(0),
+        })
     })?;
 
     Ok(collect_rows(rows, "load_item_history").0)

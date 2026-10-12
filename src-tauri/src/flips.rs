@@ -1,5 +1,5 @@
 use crate::model::ItemStats;
-use crate::model::FlipResult;
+use crate::model::{FlipResult, Risk};
 
 /// RS3 GE tax per item: 2% of the sale price, rounded down per item, no cap.
 /// Bonds are exempt; items under 50gp therefore pay nothing.
@@ -164,20 +164,27 @@ pub fn analyze(stats: &ItemStats) -> FlipResult {
         .saturating_add(crash_penalty);
 
     let mut analysis_notes = String::new();
-    
+    let mut risk = Risk::Stable;
+
     // Show crash warnings prominently at the start
     if recent_trend_crash {
         analysis_notes.push_str("🚨VOLATILE-CRASHING | ");
+        risk = Risk::Crashing;
     } else if use_recent {
         if price_crashed {
             analysis_notes.push_str("📉Crashed | ");
+            risk = Risk::Crashed;
         } else if price_spiked {
             analysis_notes.push_str("📈Spiked | ");
+            risk = Risk::Spiked;
         }
     }
-    
+
     if stats.outliers_removed > 0 {
         analysis_notes.push_str(&format!("{}⚠outliers | ", stats.outliers_removed));
+        if risk == Risk::Stable {
+            risk = Risk::Outliers;
+        }
     }
 
     FlipResult {
@@ -188,6 +195,8 @@ pub fn analyze(stats: &ItemStats) -> FlipResult {
         profit: net,
         roi,
         avg_volume: stats.avg_volume,
+        risk,
+        band: ((lo_q * 100.0).round() as u8, (hi_q * 100.0).round() as u8),
         notes: format!(
             "{}Vol:{:.0}% | Spread:{}gp | Q5-Q95:{:.0}-{:.0} | Data:{}pts",
             analysis_notes,

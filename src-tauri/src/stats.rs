@@ -55,6 +55,7 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
             data_points: prices.len(),
             ge_limit: current.ge_limit,
             prices,
+            chrono_prices,
             price_trend,
             filtered_prices,
             outliers_removed,
