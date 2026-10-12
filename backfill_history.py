@@ -1,13 +1,13 @@
 """
 RS3 Market Data Historical Backfill Script
-Fetches complete price history from Weirdgloop API for all items
+Fetches price history from Weirdgloop API for all items, keeping the last HISTORY_DAYS
 """
 
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from rs3_collector import (DB_PATH, USER_AGENT, FetchError, connect_db,
                            ensure_schema, get_with_retry)
@@ -17,6 +17,9 @@ API_URL = "https://api.weirdgloop.org/exchange/history/rs/all?id={}"
 RATE_LIMIT_DELAY = 1  # minimum seconds between requests, shared across all workers
 MAX_WORKERS = 3  # parallel workers (requests are still spaced by RATE_LIMIT_DELAY)
 BATCH_SIZE = 100  # Commit to DB every N items
+# Matches the app's longest window (365-day price chart; flips use the last 90).
+# The API has no 365-day endpoint, so the full history is fetched and older rows dropped.
+HISTORY_DAYS = 365
 
 # Thread-safe database lock
 db_lock = threading.Lock()
@@ -81,8 +84,12 @@ def fetch_item_history(item_id):
     return records if isinstance(records, list) else []
 
 
-def prepare_records(item_id, history_records):
-    """Validate raw API records. Returns (rows, skipped_count)."""
+def prepare_records(item_id, history_records, history_days=HISTORY_DAYS):
+    """Validate raw API records, dropping any older than history_days.
+
+    Returns (rows, skipped_count); dropped old records are not counted as skipped.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=history_days)).strftime('%Y-%m-%d')
     rows = []
     skipped = 0
     for record in history_records:
@@ -92,6 +99,8 @@ def prepare_records(item_id, history_records):
                 raise ValueError("non-numeric price")
             timestamp_sec = record['timestamp'] / 1000
             date_str = datetime.fromtimestamp(timestamp_sec, tz=timezone.utc).strftime('%Y-%m-%d')
+            if date_str < cutoff:
+                continue
             volume = record.get('volume')
             if isinstance(volume, bool) or not isinstance(volume, (int, float)):
                 volume = None  # unknown volume -> NULL

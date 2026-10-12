@@ -9,7 +9,13 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "rs3_market.db"
 LOG_PATH = BASE_DIR / "collector_log.txt"
-USER_AGENT = "rs3-analyzer-collector/1.0 (RS3 Grand Exchange price history tool)"
+# Weird Gloop asks for a descriptive User-Agent with a way to contact the operator
+USER_AGENT = ("rs3-analyzer-collector/1.0 (RS3 Grand Exchange price history tool; "
+              "+https://github.com/AlexMollard/rs3_analyzer)")
+DUMP_URL = "https://chisel.weirdgloop.org/gazproj/gazbot/rs_dump.json"
+LATEST_URL = "https://api.weirdgloop.org/exchange/history/rs/latest?id={}"
+LATEST_BATCH = 100        # max ids per latest request
+LATEST_BATCH_DELAY = 1.0  # seconds between latest requests
 
 MAX_RETRIES = 5
 BACKOFF_BASE = 2.0   # seconds; doubles each attempt
@@ -93,7 +99,7 @@ class RS3DataCollector:
     def __init__(self):
         self.db_name = DB_PATH
         self.log_file = LOG_PATH
-        self.url = "https://chisel.weirdgloop.org/gazproj/gazbot/rs_dump.json"
+        self.url = DUMP_URL
         self.headers = {'User-Agent': USER_AGENT}
 
     def init_db(self):
@@ -111,6 +117,70 @@ class RS3DataCollector:
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {message}\n")
 
+    def fetch_from_dump(self):
+        """Reads the full daily dump. Returns (items_to_update, history_to_insert, skipped)."""
+        res = get_with_retry(self.url, self.headers)
+        res.raise_for_status()
+        data = res.json()
+
+        # Validate per item so one bad row cannot abort the batch
+        items_to_update = []
+        history_to_insert = []
+        skipped = 0
+        today_str = datetime.now(timezone.utc).date().isoformat()
+
+        for item_id, item in data.items():
+            try:
+                if not isinstance(item, dict) or 'price' not in item:
+                    continue
+                row_id = int(item_id)
+                name = item['name']
+                price = item['price']
+                if not isinstance(name, str) or isinstance(price, bool):
+                    raise ValueError("bad name or price")
+                price = int(price)
+                limit = item.get('limit')  # missing -> NULL (unknown), not a guessed value
+                limit = None if limit is None else int(limit)
+                volume = item.get('volume')
+                volume = None if volume is None else int(volume)
+            except (ValueError, TypeError, KeyError, OverflowError):
+                skipped += 1
+                continue
+            items_to_update.append((row_id, name, limit))
+            history_to_insert.append((row_id, today_str, price, volume))
+        return items_to_update, history_to_insert, skipped
+
+    def fetch_from_latest(self, conn, sleep=time.sleep):
+        """Fallback when the dump is down: batched latest prices for items already known.
+
+        Can't discover new items or refresh names/limits, so items is left untouched.
+        Dates come from the API's own timestamp. Returns (history_to_insert, skipped).
+        """
+        ids = [row[0] for row in conn.execute("SELECT id FROM items ORDER BY id")]
+        if not ids:
+            raise FetchError("latest fallback needs existing items; run backfill_history.py first")
+
+        history_to_insert = []
+        skipped = 0
+        for start in range(0, len(ids), LATEST_BATCH):
+            if start:
+                sleep(LATEST_BATCH_DELAY)
+            batch = ids[start:start + LATEST_BATCH]
+            res = get_with_retry(LATEST_URL.format("|".join(map(str, batch))), self.headers)
+            res.raise_for_status()
+            for item_id, item in res.json().items():
+                try:
+                    price = item['price']
+                    if isinstance(price, bool):
+                        raise ValueError("bad price")
+                    record_date = datetime.strptime(item['timestamp'][:10], "%Y-%m-%d").date().isoformat()
+                    volume = item.get('volume')
+                    volume = None if volume is None else int(volume)
+                    history_to_insert.append((int(item_id), record_date, int(price), volume))
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    skipped += 1
+        return history_to_insert, skipped
+
     def run_daily_job(self):
         """Returns True on success, False on failure (also logged)."""
         conn = None
@@ -118,36 +188,14 @@ class RS3DataCollector:
             conn = self.init_db()
             c = conn.cursor()
 
-            # 1. Download
-            res = get_with_retry(self.url, self.headers)
-            res.raise_for_status()
-            data = res.json()
-
-            # 2. Process (validate per item so one bad row cannot abort the batch)
-            items_to_update = []
-            history_to_insert = []
-            skipped = 0
-            today_str = datetime.now(timezone.utc).date().isoformat()
-
-            for item_id, item in data.items():
-                try:
-                    if not isinstance(item, dict) or 'price' not in item:
-                        continue
-                    row_id = int(item_id)
-                    name = item['name']
-                    price = item['price']
-                    if not isinstance(name, str) or isinstance(price, bool):
-                        raise ValueError("bad name or price")
-                    price = int(price)
-                    limit = item.get('limit')  # missing -> NULL (unknown), not a guessed value
-                    limit = None if limit is None else int(limit)
-                    volume = item.get('volume')
-                    volume = None if volume is None else int(volume)
-                except (ValueError, TypeError, KeyError, OverflowError):
-                    skipped += 1
-                    continue
-                items_to_update.append((row_id, name, limit))
-                history_to_insert.append((row_id, today_str, price, volume))
+            source = "dump"
+            try:
+                items_to_update, history_to_insert, skipped = self.fetch_from_dump()
+            except (FetchError, requests.RequestException, ValueError) as e:
+                self.log(f"WARNING: dump unavailable ({e}); falling back to latest API")
+                source = "latest"
+                items_to_update = []
+                history_to_insert, skipped = self.fetch_from_latest(conn)
 
             c.executemany("INSERT OR REPLACE INTO items (id, name, ge_limit) VALUES (?,?,?)",
                           items_to_update)
@@ -156,7 +204,8 @@ class RS3DataCollector:
             conn.commit()
 
             # --- SUCCESS LOGGING ---
-            self.log(f"SUCCESS: Updated {len(history_to_insert)} items, skipped {skipped} malformed.")
+            self.log(f"SUCCESS ({source}): Updated {len(history_to_insert)} items, "
+                     f"skipped {skipped} malformed.")
             print("Success.")
             return True
 
