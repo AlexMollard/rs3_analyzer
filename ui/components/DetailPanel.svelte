@@ -50,6 +50,24 @@
     else if (r.qty === r.geLimit && r.buy * r.geLimit < app.budget)
       notes.push({ tone: 'info', text: `GE limit caps quantity at ${formatInt(r.geLimit)} per 4 h` });
     if (r.dataPoints < 14) notes.push({ tone: 'warn', text: `Only ${r.dataPoints} days of data` });
+    if (!r.live) {
+      notes.push({
+        tone: 'info',
+        text: app.result?.liveDate
+          ? 'No live margin: no two-sided real-time trades in the last 3 days'
+          : 'No live margin: real-time data is missing or more than 3 days old',
+      });
+    } else {
+      if (r.live.margin < 0) notes.push({ tone: 'warn', text: 'Live margin is negative: the instant-buy and instant-sell averages do not cover the GE tax' });
+      if (r.live.unitDay !== null && r.live.buy > 0) {
+        // The 1%/day line is the backtest's top expected-profit tier (docs/backtest.md)
+        const rate = r.live.unitDay / r.live.buy;
+        notes.push({
+          tone: rate >= 0.01 ? 'info' : 'warn',
+          text: `Exp/day is ${toFixedRust(rate * 100, 2)}% of the live buy price per day over ${r.live.samples} past live quotes. In the backtest it overstated profit: items rated 1%+ a day made money on average, lower-rated ones broke even or lost`,
+        });
+      }
+    }
     return notes;
   }
 
@@ -100,6 +118,20 @@
         <div class="label">Total profit</div>
         <div class="value mono" class:profit={sel.profit > 0} class:loss={sel.profit < 0}>{formatGp(sel.profit)}</div>
       </div>
+      {#if sel.live}
+        <div class="tile" title="Instant-buy minus instant-sell average over the last 3 days of real-time trades, after GE tax">
+          <div class="label">Live margin</div>
+          <div class="value mono" class:profit={sel.live.margin > 0} class:loss={sel.live.margin < 0}>{formatGp(sel.live.margin)}</div>
+        </div>
+        <div class="tile" title="Expected profit per day for the live quantity at live prices, from the item's past live quotes (mean minus one standard error)">
+          <div class="label">Exp/day at budget</div>
+          {#if sel.expDay === null}
+            <div class="value mono muted">—</div>
+          {:else}
+            <div class="value mono" class:profit={sel.expDay > 0} class:loss={sel.expDay < 0}>{formatGp(sel.expDay)}</div>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     <div class="facts mono">
@@ -108,6 +140,15 @@
       <span>Profit/ea {formatGp(sel.unitProfit)}</span>
       <span>Vol {formatVolume(sel.avgVolume)}/day</span>
     </div>
+    {#if sel.live}
+      <div class="facts mono">
+        <span>Live buy {formatGp(sel.live.buy)}</span>
+        <span>sell {formatGp(sel.live.sell)}</span>
+        <span>qty {formatInt(sel.liveQty)}</span>
+        <span>vol {formatVolume(sel.live.volume)}/day</span>
+        <span>to {app.result?.liveDate ?? '?'}</span>
+      </div>
+    {/if}
 
     <div class="notes">
       <h3>Risk notes</h3>

@@ -4,10 +4,21 @@ version = "0.2.0"
 description = "RuneScape 3 Grand Exchange flip analyzer"
 edition = "2024"
 rust-version = "1.90"
+default-run = "rs3_analyzer"
 
 [lib]
 name = "rs3_analyzer_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Dev-only backtest CLI (docs/backtest.md). Behind a feature so `tauri build`, which bundles
+# every enabled binary, leaves it out of the installers.
+[features]
+backtest = []
+
+[[bin]]
+name = "backtest"
+path = "src/bin/backtest.rs"
+required-features = ["backtest"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

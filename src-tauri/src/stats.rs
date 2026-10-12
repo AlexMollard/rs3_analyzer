@@ -11,67 +11,65 @@ pub fn build_stats(data: &[ItemSnapshot]) -> Vec<ItemStats> {
         map.entry(snap.item_id).or_default().push(snap);
     }
 
-    let mut results = Vec::new();
+    map.values().map(|records| item_stats(records)).collect()
+}
 
-    for (id, records) in map {
-        // Records arrive in chronological order (ORDER BY record_date)
-        let chrono_prices: Vec<f64> = records.iter().map(|x| x.price as f64).collect();
-        let volumes: Vec<f64> = records.iter().map(|x| x.volume as f64).collect();
+/// Stats for one item's records, which must be non-empty and in chronological order.
+/// The backtest calls this per item with each evaluation window.
+pub fn item_stats(records: &[&ItemSnapshot]) -> ItemStats {
+    // Records arrive in chronological order (ORDER BY record_date)
+    let chrono_prices: Vec<f64> = records.iter().map(|x| x.price as f64).collect();
+    let volumes: Vec<f64> = records.iter().map(|x| x.volume as f64).collect();
 
-        let current = records.last().unwrap();
+    let current = records.last().unwrap();
 
-        // Get recent prices (last 14 days) for time-weighted analysis
-        // Using 14 days instead of 30 to catch rapid crashes/spikes
-        let recent_cutoff = match day_number(&current.record_date) {
-            Some(latest) => records
-                .iter()
-                .position(|x| day_number(&x.record_date).is_some_and(|d| latest - d < RECENT_DAYS))
-                .unwrap_or(records.len()),
-            None => records.len().saturating_sub(RECENT_DAYS as usize),
-        };
-        let recent_prices_chrono: Vec<f64> = chrono_prices[recent_cutoff..].to_vec();
-        let mut recent_prices = recent_prices_chrono.clone();
-        recent_prices.sort_by(f64::total_cmp);
+    // Get recent prices (last 14 days) for time-weighted analysis
+    // Using 14 days instead of 30 to catch rapid crashes/spikes
+    let recent_cutoff = match day_number(&current.record_date) {
+        Some(latest) => records
+            .iter()
+            .position(|x| day_number(&x.record_date).is_some_and(|d| latest - d < RECENT_DAYS))
+            .unwrap_or(records.len()),
+        None => records.len().saturating_sub(RECENT_DAYS as usize),
+    };
+    let recent_prices_chrono: Vec<f64> = chrono_prices[recent_cutoff..].to_vec();
+    let mut recent_prices = recent_prices_chrono.clone();
+    recent_prices.sort_by(f64::total_cmp);
 
-        let mut prices = chrono_prices.clone();
-        prices.sort_by(f64::total_cmp);
+    let mut prices = chrono_prices.clone();
+    prices.sort_by(f64::total_cmp);
 
-        // Remove outliers using IQR method (removes DXP/update spikes), keeping chronological order
-        let (filtered_prices, outliers_removed) = remove_outliers(&chrono_prices);
+    // Remove outliers using IQR method (removes DXP/update spikes), keeping chronological order
+    let (filtered_prices, outliers_removed) = remove_outliers(&chrono_prices);
 
-        // remove_outliers falls back to the full series, so this is never sparser than the raw data
-        let price_trend = if filtered_prices.len() >= 3 {
-            calculate_trend(&filtered_prices)
-        } else {
-            0.0
-        };
+    // remove_outliers falls back to the full series, so this is never sparser than the raw data
+    let price_trend = if filtered_prices.len() >= 3 {
+        calculate_trend(&filtered_prices)
+    } else {
+        0.0
+    };
 
-        let stats = ItemStats {
-            item_id: id,
-            name: current.name.clone(),
+    ItemStats {
+        item_id: current.item_id,
+        name: current.name.clone(),
 
-            avg_volume: volumes.mean(),
+        avg_volume: volumes.mean(),
 
-            data_points: prices.len(),
-            ge_limit: current.ge_limit,
-            prices,
-            chrono_prices,
-            price_trend,
-            filtered_prices,
-            outliers_removed,
-            recent_prices,
-            recent_prices_chrono,
-        };
-
-        results.push(stats);
+        data_points: prices.len(),
+        ge_limit: current.ge_limit,
+        prices,
+        chrono_prices,
+        price_trend,
+        filtered_prices,
+        outliers_removed,
+        recent_prices,
+        recent_prices_chrono,
     }
-
-    results
 }
 
 
 // Days since 1970-01-01 for an ISO "yyyy-mm-dd" date (proleptic Gregorian)
-fn day_number(date: &str) -> Option<i64> {
+pub(crate) fn day_number(date: &str) -> Option<i64> {
     let y: i64 = date.get(0..4)?.parse().ok()?;
     let m: i64 = date.get(5..7)?.parse().ok()?;
     let d: i64 = date.get(8..10)?.parse().ok()?;

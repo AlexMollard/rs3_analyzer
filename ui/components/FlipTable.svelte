@@ -22,12 +22,26 @@
     { key: 'tier', label: 'Tier', width: 52 },
     { key: 'risk', label: 'Risk', width: 40, hideBelow: 830, title: 'Crash, spike and outlier warnings' },
     { key: 'buy', label: 'Buy', width: 72 },
-    { key: 'sell', label: 'Sell', width: 72, hideBelow: 720 },
-    { key: 'unitProfit', label: 'Profit/ea', width: 88, hideBelow: 800, title: 'Net profit per item after GE tax' },
+    { key: 'sell', label: 'Sell', width: 72, hideBelow: 640 },
+    { key: 'unitProfit', label: 'Profit/ea', width: 88, hideBelow: 1000, title: 'Net profit per item after GE tax' },
+    {
+      key: 'liveMargin',
+      label: 'Live margin',
+      width: 84,
+      hideBelow: 720,
+      title: 'Profit per item after GE tax at live prices: instant-buy minus instant-sell average over the last 3 days of real-time trades',
+    },
     { key: 'roi', label: 'ROI', width: 64 },
-    { key: 'qty', label: 'Qty', width: 76, hideBelow: 640, title: 'Quantity at your budget, capped by the GE limit' },
-    { key: 'avgVolume', label: 'Vol/day', width: 74, hideBelow: 930, title: 'Average daily volume' },
+    { key: 'qty', label: 'Qty', width: 76, hideBelow: 910, title: 'Quantity at your budget, capped by the GE limit' },
+    { key: 'avgVolume', label: 'Vol/day', width: 74, hideBelow: 1080, title: 'Average daily volume' },
     { key: 'profit', label: 'Total', width: 76, title: 'Total profit at your budget' },
+    {
+      key: 'expDay',
+      label: 'Exp/day',
+      width: 76,
+      hideBelow: 800,
+      title: "Expected profit per day at your budget and live prices, from the item's recent record at those prices. The backtest found it overstates profit",
+    },
     { key: 'score', label: 'Score', width: 62, hideBelow: 570 },
     { key: 'trend', label: 'Trend', width: 60 },
   ];
@@ -119,6 +133,12 @@
     <td class="mono">{formatGp(r.sell)}</td>
   {:else if key === 'unitProfit'}
     <td class="mono" class:profit={r.unitProfit > 0} class:loss={r.unitProfit < 0}>{formatGp(r.unitProfit)}</td>
+  {:else if key === 'liveMargin'}
+    {#if r.live}
+      <td class="mono" class:profit={r.live.margin > 0} class:loss={r.live.margin < 0}>{formatGp(r.live.margin)}</td>
+    {:else}
+      <td class="mono muted" title="No live prices for this item">—</td>
+    {/if}
   {:else if key === 'roi'}
     <td class="mono" class:loss={r.roi < 0}>{formatPct(r.roi)}</td>
   {:else if key === 'qty'}
@@ -127,6 +147,12 @@
     <td class="mono muted">{formatVolume(r.avgVolume)}</td>
   {:else if key === 'profit'}
     <td class="mono" class:profit={r.profit > 0} class:loss={r.profit < 0}>{formatGp(r.profit)}</td>
+  {:else if key === 'expDay'}
+    {#if r.expDay === null}
+      <td class="mono muted" title={r.live ? 'Fewer than 2 past signals at live prices' : 'No live prices for this item'}>—</td>
+    {:else}
+      <td class="mono" class:profit={r.expDay > 0} class:loss={r.expDay < 0}>{formatGp(r.expDay)}</td>
+    {/if}
   {:else if key === 'score'}
     <td class="mono" class:loss={r.score < 0}>{r.score}</td>
   {:else if key === 'trend'}

@@ -1,3 +1,4 @@
+pub mod backtest;
 mod commands;
 mod favorites;
 mod flips;
@@ -6,6 +7,7 @@ mod format;
 mod loader;
 mod model;
 mod stats;
+mod trade;
 
 use commands::{ScanError, ScanResult};
 use favorites::Favorites;
@@ -101,7 +103,13 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use crate::{flips::ge_tax, format::format_gp, loader::load_snapshots, model::ItemSnapshot, stats::build_stats};
+    use crate::{
+        flips::ge_tax,
+        format::format_gp,
+        loader::{load_rt, load_snapshots},
+        model::ItemSnapshot,
+        stats::build_stats,
+    };
 
     fn snap(date: String, price: i32) -> ItemSnapshot {
         ItemSnapshot {
@@ -156,6 +164,34 @@ mod tests {
         let stats = build_stats(&snaps);
         assert!(stats[0].price_trend > 0.0);
         let _ = crate::flips::analyze(&stats[0]);
+    }
+
+    #[test]
+    fn rt_daily_loads_and_is_optional() {
+        let path = std::env::temp_dir().join("rs3_analyzer_rt_test.db");
+        let _ = std::fs::remove_file(&path);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, ge_limit INTEGER);")
+            .unwrap();
+        // Databases from before the real-time table still scan
+        let before = load_rt(&path, Some(40)).unwrap().0.len();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE rt_daily (item_id INTEGER, record_date TEXT, avg_high REAL, avg_low REAL,
+                                        high_volume INTEGER, low_volume INTEGER, PRIMARY KEY (item_id, record_date));
+                 INSERT INTO rt_daily VALUES (1, date('now', '-50 days'), 10.0, 9.0, 5, 5);
+                 INSERT INTO rt_daily VALUES (1, date('now', '-2 days'), 10.5, NULL, 7, 0);
+                 INSERT INTO rt_daily VALUES (1, date('now', '-1 days'), 11, 9.5, 8, 6);",
+            )
+            .unwrap();
+        let (recent, skipped) = load_rt(&path, Some(40)).unwrap();
+        let all = load_rt(&path, None).unwrap().0;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((before, recent.len(), skipped, all.len()), (0, 2, 0, 3));
+        assert_eq!(recent[0].avg_low, None);
+        assert_eq!(recent[1].avg_high, Some(11.0));  // an integer in a REAL column reads as f64
     }
 
     #[test]

@@ -78,9 +78,15 @@ export function limitText(r: PricedRow): string {
   return r.geLimit === null ? 'GE limit: ? (unknown, qty not capped)' : `GE limit: ${formatInt(r.geLimit)}`;
 }
 
-/** Same layout as the egui copy button. */
+/** Same layout as the egui copy button, plus the live quote when there is one. */
 export function copyText(r: PricedRow): string {
   const limitNote = r.geLimit === null ? ' (GE limit ?)' : '';
+  const live = r.live
+    ? [
+        `Live buy/sell: ${formatGp(r.live.buy)} / ${formatGp(r.live.sell)} (margin ${formatGp(r.live.margin)})`,
+        `Exp/day: ${r.expDay === null ? '?' : formatGp(r.expDay)} (qty ${r.liveQty}, ${r.live.samples} past signals)`,
+      ]
+    : [];
   return [
     `${r.name}:`,
     `Score: ${r.score}`,
@@ -92,6 +98,7 @@ export function copyText(r: PricedRow): string {
     `Total cost: ${formatGp(r.totalCost)}`,
     `Profit: ${formatGp(r.profit)}`,
     `ROI: ${toFixedRust(r.roi, 1)}%`,
+    ...live,
   ].join('\n');
 }
 

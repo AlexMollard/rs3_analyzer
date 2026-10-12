@@ -55,6 +55,21 @@ function makeRows(): FlipRow[] {
         const trend = (rand() - 0.45) * 3;
         const risk = RISKS[Math.floor(rand() * RISKS.length)];
         const itemId = id++;
+        // About a third of items have no recent two-sided real-time trades
+        const liveBuy = Math.round(buy * (1 + (rand() - 0.3) * 0.08));
+        const liveSell = Math.round(liveBuy * (1 + (rand() - 0.25) * 0.1));
+        const samples = Math.floor(rand() * 22);
+        const live =
+          rand() < 0.35
+            ? null
+            : {
+                buy: liveBuy,
+                sell: liveSell,
+                margin: liveSell - liveBuy - (name.startsWith('Bond') ? 0 : Math.floor(liveSell / 50)),
+                volume: Math.round(10 ** (1 + rand() * 4)),
+                unitDay: samples < 2 ? null : Math.round(liveBuy * (rand() - 0.5) * 0.03 * 100) / 100,
+                samples,
+              };
         rows.push({
           itemId,
           name,
@@ -74,6 +89,7 @@ function makeRows(): FlipRow[] {
           band: risk === 'crashed' || risk === 'spiked' ? [15, 85] : [10, 90],
           notes: `Vol:${Math.round(margin * 100 + 5)}% | Spread:${sell - buy}gp | Q5-Q95:${Math.round(buy * 0.95)}-${Math.round(sell * 1.05)} | Data:90pts`,
           spark: priceSeries(itemId, 30, (buy + sell) / 2, trend),
+          live,
         });
       }
     }
@@ -105,7 +121,7 @@ export const mockBackend: Backend = {
       throw err;
     }
     rows ??= makeRows();
-    return { rows, skippedRows: 0, snapshotDate: '2026-10-12', itemCount: rows.length, dbPath: 'mock' };
+    return { rows, skippedRows: 0, snapshotDate: '2026-10-12', liveDate: '2026-10-11', itemCount: rows.length, dbPath: 'mock' };
   },
   async itemHistory(itemId) {
     await sleep(120);

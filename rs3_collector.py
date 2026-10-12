@@ -1,7 +1,7 @@
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -16,6 +16,13 @@ DUMP_URL = "https://chisel.weirdgloop.org/gazproj/gazbot/rs_dump.json"
 LATEST_URL = "https://api.weirdgloop.org/exchange/history/rs/latest?id={}"
 LATEST_BATCH = 100        # max ids per latest request
 LATEST_BATCH_DELAY = 1.0  # seconds between latest requests
+# RuneScape Wiki real-time prices: bulk hourly averages of instant-buy ("high") and
+# instant-sell ("low") trades for every item. Same item ids as the GE.
+RT_HOUR_URL = "https://prices.runescape.wiki/api/v2/rs/1h?timestamp={}"
+RT_FIRST_DAY = "2026-07-24"  # first complete UTC day (data starts 2026-07-23 17:00 UTC)
+RT_REQUEST_DELAY = 1.0       # seconds before each real-time request
+RT_CATCHUP_DAYS = 7          # the daily job fills at most this many recent days
+RT_SETTLE = 3600             # seconds after midnight UTC before yesterday counts as complete
 
 MAX_RETRIES = 5
 BACKOFF_BASE = 2.0   # seconds; doubles each attempt
@@ -51,8 +58,20 @@ def ensure_schema(conn):
                     volume INTEGER,
                     PRIMARY KEY (item_id, record_date))''')
 
+    # Real-time daily averages folded from the wiki's hourly buckets: volume-weighted
+    # instant-buy (high) and instant-sell (low) prices, NULL when that side did not trade
+    conn.execute('''CREATE TABLE IF NOT EXISTS rt_daily (
+                    item_id INTEGER,
+                    record_date TEXT,
+                    avg_high REAL,
+                    avg_low REAL,
+                    high_volume INTEGER,
+                    low_volume INTEGER,
+                    PRIMARY KEY (item_id, record_date))''')
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_history_record_date ON history(record_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_name ON items(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rt_daily_record_date ON rt_daily(record_date)")
     conn.commit()
 
 
@@ -93,6 +112,134 @@ def get_with_retry(url, headers, timeout=30, retries=MAX_RETRIES,
         if attempt < retries:
             sleep(delay)
     raise FetchError(f"{url}: {last} after {retries + 1} attempts")
+
+
+def _rt_side(item, price_key, volume_key):
+    """(price, volume) for one side of an hourly entry, (None, 0) if that side did not trade.
+
+    Raises ValueError for a malformed side. Prices may be fractional and exceed 32 bits.
+    """
+    price, volume = item.get(price_key), item.get(volume_key)
+    if price is None or not volume:
+        return None, 0
+    if isinstance(price, bool) or not isinstance(price, (int, float)) or not 0 < price < float("inf"):
+        raise ValueError("bad price")
+    if isinstance(volume, bool) or not isinstance(volume, int) or volume < 0:
+        raise ValueError("bad volume")
+    return price, volume
+
+
+def aggregate_rt_hours(buckets):
+    """Folds a day's hourly real-time buckets into one row per item.
+
+    Each side's price is volume-weighted over the hours it traded; a side that never traded
+    gets a NULL price and 0 volume. Items that did not trade at all are left out and malformed
+    entries are skipped. Returns ({item_id: (avg_high, avg_low, high_volume, low_volume)}, skipped).
+    """
+    totals = {}  # item_id -> [high gp*qty, high qty, low gp*qty, low qty]
+    skipped = 0
+    for data in buckets:
+        for key, item in data.items():
+            try:
+                item_id = int(key)
+                sides = (_rt_side(item, "avgHighPrice", "highPriceVolume"),
+                         _rt_side(item, "avgLowPrice", "lowPriceVolume"))
+            except (TypeError, ValueError, AttributeError):
+                skipped += 1
+                continue
+            t = totals.setdefault(item_id, [0.0, 0, 0.0, 0])
+            for i, (price, volume) in enumerate(sides):
+                if volume:
+                    t[2 * i] += price * volume
+                    t[2 * i + 1] += volume
+    rows = {}
+    for item_id, (high_gp, high_qty, low_gp, low_qty) in totals.items():
+        if high_qty or low_qty:
+            rows[item_id] = (high_gp / high_qty if high_qty else None,
+                             low_gp / low_qty if low_qty else None,
+                             high_qty, low_qty)
+    return rows, skipped
+
+
+def fetch_rt_day(day, headers, sleep=time.sleep, http_get=requests.get):
+    """Fetches the 24 hourly real-time buckets of a UTC day ('YYYY-MM-DD'), one bulk request each.
+
+    Raises FetchError if any bucket fails, is empty or is for a different hour, so a partial
+    day is never stored.
+    """
+    start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    buckets = []
+    for hour in range(24):
+        ts = start + hour * 3600
+        where = f"real-time {day} {hour:02d}:00 UTC"
+        res = get_with_retry(RT_HOUR_URL.format(ts), headers, sleep=sleep, http_get=http_get,
+                             before_request=lambda: sleep(RT_REQUEST_DELAY))
+        if res.status_code != 200:
+            raise FetchError(f"{where}: HTTP {res.status_code}")
+        try:
+            body = res.json()
+        except ValueError as e:
+            raise FetchError(f"{where}: invalid JSON ({e})")
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, dict) or not data or body.get("timestamp") != ts:
+            raise FetchError(f"{where}: empty bucket or wrong hour")
+        buckets.append(data)
+    return buckets
+
+
+def last_complete_rt_day(now=None):
+    """The latest UTC day whose hourly buckets are all final ('YYYY-MM-DD')."""
+    now = now or datetime.now(timezone.utc)
+    return ((now - timedelta(seconds=RT_SETTLE)).date() - timedelta(days=1)).isoformat()
+
+
+def missing_rt_days(conn, first_day, last_day):
+    """Days in [first_day, last_day] with no rt_daily rows (days are written atomically)."""
+    have = {row[0] for row in conn.execute(
+        "SELECT DISTINCT record_date FROM rt_daily WHERE record_date BETWEEN ? AND ?", (first_day, last_day))}
+    days = []
+    day, last = date.fromisoformat(first_day), date.fromisoformat(last_day)
+    while day <= last:
+        if day.isoformat() not in have:
+            days.append(day.isoformat())
+        day += timedelta(days=1)
+    return days
+
+
+def store_rt_day(conn, day, rows):
+    """Replaces a day's rt_daily rows in one transaction."""
+    with conn:
+        conn.execute("DELETE FROM rt_daily WHERE record_date = ?", (day,))
+        conn.executemany("INSERT INTO rt_daily (item_id, record_date, avg_high, avg_low, high_volume, low_volume) "
+                         "VALUES (?,?,?,?,?,?)", [(item_id, day, *row) for item_id, row in sorted(rows.items())])
+
+
+def update_rt_days(conn, days, headers, report=None, stop_on_failure=False,
+                   sleep=time.sleep, http_get=requests.get):
+    """Fetches and stores each day; a failed day is not stored, so the next run retries it.
+
+    report (if given) receives one progress line per day. stop_on_failure skips the remaining
+    days after a failure (the API is probably down). Returns (stored, failed): lists of
+    (day, item_count) and (day, error).
+    """
+    stored, failed = [], []
+    for day in days:
+        if failed and stop_on_failure:
+            break
+        try:
+            rows, skipped = aggregate_rt_hours(fetch_rt_day(day, headers, sleep=sleep, http_get=http_get))
+            if not rows:
+                raise FetchError(f"real-time {day}: no valid items")
+            store_rt_day(conn, day, rows)
+        except (FetchError, requests.RequestException, ValueError, sqlite3.Error) as e:
+            failed.append((day, str(e)))
+            line = f"{day}: FAILED - {e}"
+        else:
+            stored.append((day, len(rows)))
+            line = f"{day}: {len(rows):,} items" + (f" ({skipped} malformed skipped)" if skipped else "")
+        if report:
+            report(line)
+    return stored, failed
 
 
 class RS3DataCollector:
@@ -181,6 +328,15 @@ class RS3DataCollector:
                     skipped += 1
         return history_to_insert, skipped
 
+    def update_realtime(self, conn):
+        """Stores yesterday's real-time averages, catching up at most RT_CATCHUP_DAYS missing days.
+
+        Stops at the first failed day. Returns (stored, failed) like update_rt_days.
+        """
+        last = last_complete_rt_day()
+        first = max(RT_FIRST_DAY, (date.fromisoformat(last) - timedelta(days=RT_CATCHUP_DAYS - 1)).isoformat())
+        return update_rt_days(conn, missing_rt_days(conn, first, last), self.headers, stop_on_failure=True)
+
     def run_daily_job(self):
         """Returns True on success, False on failure (also logged)."""
         conn = None
@@ -206,6 +362,19 @@ class RS3DataCollector:
             # --- SUCCESS LOGGING ---
             self.log(f"SUCCESS ({source}): Updated {len(history_to_insert)} items, "
                      f"skipped {skipped} malformed.")
+
+            # Real-time data is optional: problems are logged but never fail the daily job
+            try:
+                stored, failed = self.update_realtime(conn)
+                if stored:
+                    self.log("SUCCESS (real-time): " + ", ".join(f"{day} {n} items" for day, n in stored))
+                for day, error in failed:
+                    self.log(f"WARNING: real-time {day} not stored ({error})")
+            except Exception as e:
+                try:
+                    self.log(f"WARNING: real-time update failed ({e})")
+                except OSError:
+                    pass
             print("Success.")
             return True
 

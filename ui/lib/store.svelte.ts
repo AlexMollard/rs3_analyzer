@@ -61,7 +61,8 @@ class AppState {
         this.selectedId = null;
       }
       const secs = ((performance.now() - started) / 1000).toFixed(1);
-      this.status = { text: `Loaded ${formatInt(result.itemCount)} items in ${secs} s`, kind: 'ok' };
+      const live = result.liveDate ? `live prices to ${result.liveDate}` : 'no recent real-time data';
+      this.status = { text: `Loaded ${formatInt(result.itemCount)} items in ${secs} s, ${live}`, kind: 'ok' };
     } catch (e) {
       const err = e as Partial<ScanError>;
       if (Array.isArray(err?.searched) && err.searched.length > 0) {

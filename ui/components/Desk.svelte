@@ -7,7 +7,8 @@
 
   const SORT_LABEL: Record<string, string> = {
     name: 'Item', tier: 'Tier', risk: 'Risk', buy: 'Buy', sell: 'Sell', unitProfit: 'Profit/ea', roi: 'ROI',
-    qty: 'Qty', avgVolume: 'Vol/day', profit: 'Total', score: 'Score', trend: 'Trend',
+    qty: 'Qty', avgVolume: 'Vol/day', profit: 'Total', score: 'Score', trend: 'Trend', liveMargin: 'Live margin',
+    expDay: 'Exp/day',
   };
   const STEPS = ['Read 90 days of history', 'Building price stats', 'Scoring flips'];
   const SKELETON = [180, 240, 150, 210, 170, 260, 140, 200, 230, 160, 190, 220, 150, 210];

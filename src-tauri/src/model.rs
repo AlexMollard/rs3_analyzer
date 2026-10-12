@@ -27,6 +27,16 @@ pub struct ItemStats {
 }
 
 
+/// One day of an item's real-time averages (rt_daily). Prices are None when that side did not trade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtDay {
+    pub day: i64,  // days since 1970-01-01
+    pub high: Option<f64>,  // volume-weighted instant-buy price
+    pub low: Option<f64>,  // volume-weighted instant-sell price
+    pub high_volume: f64,
+    pub low_volume: f64,
+}
+
 /// Headline risk, in priority order (same order the notes prefix uses)
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]

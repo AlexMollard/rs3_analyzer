@@ -1,5 +1,6 @@
 use crate::model::ItemStats;
-use crate::model::{FlipResult, Risk};
+use crate::model::{FlipResult, Risk, RtDay};
+use crate::trade::{HORIZON, Order, rt_path, rt_window, simulate};
 
 /// RS3 GE tax per item: 2% of the sale price, rounded down per item, no cap.
 /// Bonds are exempt; items under 50gp therefore pay nothing.
@@ -9,6 +10,86 @@ pub fn ge_tax(price_per_item: i32, item_name: &str) -> i32 {
     } else {
         price_per_item.max(0) / 50  // == floor(2%), without i32 overflow
     }
+}
+
+/// Offer prices from recent real-time days: bid at the instant-sell (low) average, ask at the
+/// instant-buy (high) average, both the median over the days where both sides traded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveQuote {
+    pub buy: i32,
+    pub sell: i32,
+    pub margin: f64,  // per unit after GE tax
+    pub volume: f64,  // median daily min(instant-buy, instant-sell) volume
+    pub days: usize,  // two-sided days used
+}
+
+/// Median; NaN when empty.
+pub(crate) fn median(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(f64::total_cmp);
+    let m = v.len() / 2;
+    if v.len().is_multiple_of(2) { (v[m - 1] + v[m]) / 2.0 } else { v[m] }
+}
+
+/// None when no day in `days` traded on both sides.
+pub fn live_quote(days: &[RtDay], name: &str) -> Option<LiveQuote> {
+    let both: Vec<(f64, f64, f64)> = days
+        .iter()
+        .filter_map(|d| Some((d.low?, d.high?, d.low_volume.min(d.high_volume))))
+        .collect();
+    if both.is_empty() {
+        return None;
+    }
+    let gp = |v: f64| v.round().clamp(0.0, f64::from(i32::MAX)) as i32;
+    let buy = gp(median(both.iter().map(|x| x.0).collect()));
+    let sell = gp(median(both.iter().map(|x| x.1).collect()));
+    Some(LiveQuote {
+        buy,
+        sell,
+        margin: f64::from(sell) - f64::from(buy) - f64::from(ge_tax(sell, name)),
+        volume: median(both.iter().map(|x| x.2).collect()),
+        days: both.len(),
+    })
+}
+
+/// Real-time days behind the app's live quote, and the track-record lookback (docs/backtest.md).
+pub const LIVE_QUOTE_DAYS: i64 = 3;
+pub const LIVE_LOOKBACK: i64 = 28;
+
+/// Mean of past per-day results, minus one standard error with `lcb`. None with fewer than two.
+pub(crate) fn track_record(past: &[f64], lcb: bool) -> Option<f64> {
+    if past.len() < 2 {
+        return None;
+    }
+    let n = past.len() as f64;
+    let m = past.iter().sum::<f64>() / n;
+    let sd = (past.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+    Some(if lcb { m - sd / n.sqrt() } else { m })
+}
+
+/// An item's live quote and how the same quote rule has done for it lately.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveEstimate {
+    pub quote: LiveQuote,
+    pub unit_day: Option<f64>,  // expected realised profit/day of one unit; None with < 2 past signals
+    pub samples: usize,  // past signals behind unit_day
+}
+
+/// The live quote as of day `t` and its track record: the quote rule replayed for one unit on
+/// each day in [t - lookback, t - HORIZON - 1], whose outcomes are all known by day `t`.
+/// None when there is no quote at `t`.
+pub fn live_estimate(rt: &[RtDay], name: &str, t: i64, quote_days: i64, lookback: i64, lcb: bool) -> Option<LiveEstimate> {
+    let quote = live_quote(rt_window(rt, t, quote_days), name)?;
+    let past: Vec<f64> = (t - lookback..t - HORIZON)
+        .filter_map(|tp| {
+            let q = live_quote(rt_window(rt, tp, quote_days), name)?;
+            let order = Order { buy: q.buy, sell: q.sell, qty: 1, name };
+            Some(simulate(&order, tp, &rt_path(rt, tp), 1.0).per_day())
+        })
+        .collect();
+    Some(LiveEstimate { quote, unit_day: track_record(&past, lcb), samples: past.len() })
 }
 
 pub fn analyze(stats: &ItemStats) -> FlipResult {
