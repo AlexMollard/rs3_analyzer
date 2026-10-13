@@ -3,6 +3,7 @@
   import { app } from './lib/store.svelte.ts';
   import Desk from './components/Desk.svelte';
   import StatusBar from './components/StatusBar.svelte';
+  import Strategy from './components/Strategy.svelte';
   import TopBar from './components/TopBar.svelte';
   import Watchlist from './components/Watchlist.svelte';
   import Welcome from './components/Welcome.svelte';
@@ -32,12 +33,13 @@
 
   onMount(async () => {
     await app.init();
-    // Dev-only deep links for screenshots: ?mock&select=<itemId>&tab=watch
+    // Dev-only deep links for screenshots: ?mock&select=<itemId>&tab=watch (or tab=strategy)
     if (import.meta.env.DEV) {
       const p = new URLSearchParams(location.search);
       const sel = Number(p.get('select'));
       if (sel) app.select(sel);
-      if (p.get('tab') === 'watch') app.tab = 'watch';
+      const tab = p.get('tab');
+      if (tab === 'watch' || tab === 'strategy') app.tab = tab;
     }
   });
 </script>
@@ -51,6 +53,8 @@
       <Watchlist />
     {:else if app.missingDb}
       <Welcome searched={app.missingDb} />
+    {:else if app.tab === 'strategy'}
+      <Strategy />
     {:else}
       <Desk />
     {/if}

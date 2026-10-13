@@ -4,6 +4,7 @@ mod favorites;
 mod flips;
 #[cfg(test)]
 mod format;
+mod hourly;
 mod loader;
 mod model;
 mod stats;
@@ -106,7 +107,7 @@ mod tests {
     use crate::{
         flips::ge_tax,
         format::format_gp,
-        loader::{load_rt, load_snapshots},
+        loader::{first_rt_hours, load_rt, load_rt_hourly, load_snapshots, newest_rt_hour},
         model::ItemSnapshot,
         stats::build_stats,
     };
@@ -195,6 +196,48 @@ mod tests {
     }
 
     #[test]
+    fn rt_hourly_loads_grouped_by_item_and_is_optional() {
+        let path = std::env::temp_dir().join("rs3_analyzer_rt_hourly_test.db");
+        let _ = std::fs::remove_file(&path);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, ge_limit INTEGER);")
+            .unwrap();
+        let before = load_rt_hourly(&path, None).unwrap().0.len();
+        assert_eq!((newest_rt_hour(&path).unwrap(), first_rt_hours(&path).unwrap().len()), (None, 0));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE rt_hourly (item_id INTEGER, ts INTEGER, avg_high REAL, avg_low REAL,
+                                         high_volume INTEGER, low_volume INTEGER, PRIMARY KEY (item_id, ts)) WITHOUT ROWID;
+                 INSERT INTO items VALUES (1, 'One', NULL), (2, 'Two', 10), (3, 'Three', 10);
+                 INSERT INTO rt_hourly VALUES (2, 7200, 11, 9.5, 8, 6);
+                 INSERT INTO rt_hourly VALUES (1, 3600, 10.5, NULL, 7, 0);
+                 INSERT INTO rt_hourly VALUES (1, 0, 10.0, 9.0, 5, 5);
+                 INSERT INTO rt_hourly VALUES (9, 7200, 11, 9.5, 8, 6);",
+            )
+            .unwrap();
+        let (all, skipped) = load_rt_hourly(&path, None).unwrap();
+        let recent = load_rt_hourly(&path, Some(3600)).unwrap().0;
+        let newest = newest_rt_hour(&path).unwrap();
+        let first = first_rt_hours(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((before, skipped), (0, 0));
+        // The windowed load and the first buckets cover items in the items table only
+        assert_eq!(all.len(), 3);
+        assert_eq!(newest, Some(2));
+        assert_eq!(first, std::collections::HashMap::from([(1, 0), (2, 2)]));
+        assert_eq!(all.iter().map(|(id, h)| (*id, h.iter().map(|b| b.hour).collect::<Vec<_>>())).collect::<Vec<_>>(), vec![
+            (1, vec![0, 1]),
+            (2, vec![2]),
+            (9, vec![2])
+        ]);
+        assert_eq!(all[0].1[1].low, None);
+        assert_eq!(all[1].1[0].high, Some(11.0));  // an integer in a REAL column reads as f64
+        assert_eq!(recent.iter().map(|(id, h)| (*id, h.len())).collect::<Vec<_>>(), vec![(1, 1), (2, 1)]);
+    }
+
+    #[test]
     fn missing_db_is_not_created() {
         let path = std::env::temp_dir().join("rs3_analyzer_missing_test.db");
         let _ = std::fs::remove_file(&path);
@@ -260,6 +303,20 @@ mod tests {
         let scored = stats.iter().map(crate::flips::analyze).filter(|r| r.buy > i64::from(i32::MAX)).count();
         println!("snapshots={} skipped={} items={} items_above_i32={} scored_above_i32={}", snaps.len(), skipped, stats.len(), big, scored);
         assert_eq!(skipped, 0);
+        // The app's whole scan, hourly strategy quotes included
+        let started = std::time::Instant::now();
+        let scan = crate::commands::scan_db(&path, &|_| {}).unwrap();
+        let quotes = scan.rows.iter().filter(|r| r.strategy.is_some()).count();
+        let s = &scan.strategy;
+        println!(
+            "scan_db: {:.2}s, rows={} skipped={} strategy quotes={} signal day={:?} hourly data through={:?}",
+            started.elapsed().as_secs_f64(),
+            scan.rows.len(),
+            scan.skipped_rows,
+            quotes,
+            s.signal_date,
+            s.data_through
+        );
     }
 
     #[test]

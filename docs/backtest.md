@@ -360,13 +360,14 @@ The real-time study covers only items with recent real-time trades, over a short
 
 ## What changed in the app
 
-- **Data.** `rs3_collector.py` adds yesterday's real-time day to `rt_daily` after its daily job, catching up at most 7 missing days. A real-time failure is logged as a warning and does not fail the job. `backfill_rt.py` fills the table from 2026-07-24.
+- **Data.** `rs3_collector.py` stores the missing real-time hours of the last 7 days and today in `rt_hourly` after its daily job, then folds each missing complete day into `rt_daily`. A real-time failure is logged as a warning and does not fail the job. `backfill_rt.py` fills `rt_hourly` from 2026-07-23 17:00 UTC and `rt_daily` from 2026-07-24. (The folding from stored hours was added after this study; it gives the same `rt_daily` rows. See [strategy.md](strategy.md).)
 - **Scan.** For each item, the scan computes `flips::live_estimate` as of the newest `rt_daily` day. It uses a 3-day quote, a 28-day track record and the one-standard-error penalty, which is `emp-3d-28-lcb` above. These settings were fixed before any held-out result. Real-time data whose newest day is more than 3 days old is not shown. Without the table, or without readable rows, the scan works exactly as before.
 - **UI.**
   - The table has two new columns: **Live margin** (profit per item after tax at the live instant-sell and instant-buy averages) and **Exp/day** (the track record × the live quantity at your budget, capped at 10% of the live volume).
   - The detail panel adds Live margin and Exp/day tiles, the live buy, sell, quantity and volume, and risk notes when there is no live data, when the live margin is negative, and on how far Exp/day can be trusted.
   - The default sort is still Score.
   - `ui/lib/price-cases.json` holds shared cases that check the UI's live quantity and Exp/day against the backtest's order size and rank key in both Rust and TypeScript.
+- **Strategy tab.** A later, separate search for hourly strategies ([strategy.md](strategy.md)) added a Strategy tab. It leaves the Trading Desk and its default Score ranking unchanged.
 
 ## Limitations
 
@@ -398,10 +399,10 @@ The database is opened read-only. From `src-tauri/`:
 
 ```bash
 cargo run --release --features backtest --bin backtest -- --help
-cargo run --release --features backtest --bin backtest                  # full report on stdout
-cargo run --release --features backtest --bin backtest -- --out report.md
-cargo run --release --features backtest --bin backtest -- --budgets 50m --k 10 --strategies baseline,live-3d
-cargo run --release --features backtest --bin backtest -- --trace 4151   # every signal and trade for one item
+cargo run --release --features backtest --bin backtest -- --db ../rs3_market.db   # full report on stdout
+cargo run --release --features backtest --bin backtest -- --db ../rs3_market.db --out report.md
+cargo run --release --features backtest --bin backtest -- --db ../rs3_market.db --budgets 50m --k 10 --strategies baseline,live-3d
+cargo run --release --features backtest --bin backtest -- --db ../rs3_market.db --trace 4151   # every signal and trade for one item
 ```
 
 The tables above come from the full default run on the database described under [Data](#data), which takes about a minute. The binary is behind the `backtest` feature so that `pnpm tauri build`, which bundles every enabled binary, leaves it out of the installers. A plain `cargo run --bin backtest` therefore asks for `--features backtest`. The simulator, metrics, look-ahead rules and the UI parity cases are covered by `cargo test` (`src/trade.rs`, `src/backtest.rs`).

@@ -1,5 +1,5 @@
 // Budget, filter and sort logic (budget-dependent, so it runs here instead of rescanning the DB)
-import type { FlipRow, PricedRow, Risk, Tier } from './types.ts';
+import type { FlipRow, PricedRow, Risk, StrategyQuote, Tier } from './types.ts';
 
 export const MIN_BUDGET = 100_000;
 export const DEFAULT_BUDGET = 50_000_000;
@@ -29,6 +29,40 @@ export function priceRow(r: FlipRow, budget: number): PricedRow {
   const liveQty = r.live ? Math.min(orderQty(r.live.buy, r.geLimit, budget), Math.floor(VOLUME_SHARE * r.live.volume)) : 0;
   const expDay = r.live?.unitDay == null ? null : r.live.unitDay * liveQty;
   return { ...r, qty, profit: Math.round(r.unitProfit * qty), totalCost: r.buy * qty, liveQty, expDay };
+}
+
+/**
+ * One strategy pick's buy offer size (its share of the budget, capped by the GE limit) and
+ * capacity: the offer also capped at VOLUME_SHARE of the hourly volume, the size of one round
+ * trip (hourly::capacity in src-tauri/src/hourly.rs; cases shared in strategy-cases.json).
+ */
+export function strategySize(q: StrategyQuote, geLimit: number | null, alloc: number): { qty: number; capacity: number } {
+  const qty = orderQty(q.buy, geLimit, alloc);
+  return { qty, capacity: Math.min(qty, Math.floor(VOLUME_SHARE * q.liquidity)) };
+}
+
+export interface StrategyPick {
+  row: FlipRow;
+  quote: StrategyQuote;
+  qty: number;
+  capacity: number;
+  tripProfit: number; // margin x capacity: one round trip's expected profit, the rank key
+}
+
+/**
+ * The hourly strategy's day: the top `picks` items, each with budget / picks, by margin x capacity
+ * (the item id breaks ties; no capacity, no pick), as the backtest trades them.
+ */
+export function strategyPicks(rows: FlipRow[], budget: number, picks: number): StrategyPick[] {
+  const alloc = budget / picks;
+  const out: StrategyPick[] = [];
+  for (const row of rows) {
+    if (!row.strategy) continue;
+    const { qty, capacity } = strategySize(row.strategy, row.geLimit, alloc);
+    if (capacity >= 1) out.push({ row, quote: row.strategy, qty, capacity, tripProfit: row.strategy.margin * capacity });
+  }
+  out.sort((a, b) => b.tripProfit - a.tripProfit || a.row.itemId - b.row.itemId);
+  return out.slice(0, picks);
 }
 
 export interface Filters {

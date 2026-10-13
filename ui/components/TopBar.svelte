@@ -6,12 +6,19 @@
   const tabs: { id: Tab; label: () => string }[] = [
     { id: 'desk', label: () => 'Trading Desk' },
     { id: 'watch', label: () => `Watchlist (${app.favorites.size})` },
+    { id: 'strategy', label: () => 'Strategy' },
   ];
+  // Until a scan says otherwise, the strategy counts as not validated
+  const experimental = $derived(app.result?.strategy.validated !== true);
 
+  /** Arrow keys move between tabs (wrapping), Home and End jump to the ends. */
   function onTabKey(e: KeyboardEvent) {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const i = tabs.findIndex((t) => t.id === app.tab);
+    const moves: Partial<Record<string, number>> = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 };
+    const next = moves[e.key];
+    if (next === undefined) return;
     e.preventDefault();
-    app.tab = app.tab === 'desk' ? 'watch' : 'desk';
+    app.tab = tabs[(next + tabs.length) % tabs.length].id;
     document.getElementById(`tab-${app.tab}`)?.focus();
   }
 </script>
@@ -55,7 +62,8 @@
         aria-controls="panel-{t.id}"
         tabindex={app.tab === t.id ? 0 : -1}
         onclick={() => (app.tab = t.id)}
-        onkeydown={onTabKey}>{t.label()}</button
+        onkeydown={onTabKey}
+        >{t.label()}{#if t.id === 'strategy' && experimental}{' '}<span class="tag">Experimental</span>{/if}</button
       >
     {/each}
   </div>
@@ -160,5 +168,18 @@
     border-color: var(--border-strong);
     box-shadow: inset 0 2px 0 var(--accent);
     margin-bottom: -2px;
+  }
+  .tag {
+    margin-left: 4px;
+    padding: 1px 6px;
+    border: 1px solid var(--tier-b);
+    border-radius: var(--radius);
+    color: var(--tier-b);
+    font-family: var(--font-body);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    vertical-align: 1px;
   }
 </style>

@@ -23,6 +23,40 @@ export interface FlipRow {
   notes: string;
   spark: number[];
   live: LiveQuote | null; // null without fresh real-time data for the item
+  strategy: StrategyQuote | null; // null when the hourly strategy would not trade the item
+}
+
+/** The hourly strategy's offers for an item; the UI ranks them (strategyPicks in flips.ts). */
+export interface StrategyQuote {
+  buy: number; // bid
+  sell: number; // ask
+  margin: number; // per item after tax
+  liquidity: number; // median units per hour on the thinner side
+}
+
+/** One held-out test result of the strategy, top `picks` at one budget. */
+export interface StrategyResult {
+  budget: number;
+  trips: number;
+  winRate: number; // profitable trips / trips, 0-1
+  winCi: [number, number]; // 95% block-bootstrap interval
+  profitDay: number; // mean realised gp per signal day
+  profitCi: [number, number];
+}
+
+/** What the backend says about the hourly strategy (StrategyInfo in commands.rs). */
+export interface StrategyInfo {
+  name: string;
+  description: string;
+  validated: boolean; // met the bar on the held-out test
+  signalDate: string | null; // UTC day the quotes are for; null without recent hourly data
+  dataThrough: string | null; // newest stored bucket, 'yyyy-mm-dd hh:00' UTC
+  signalHour: number; // UTC hour the signal is taken
+  entryHours: number; // bids can fill in the buckets this many hours after the signal
+  horizonHours: number; // sales run to this many hours after it; the last bucket takes the forced exit
+  picks: number; // items traded per day, each with budget / picks
+  testDays: string; // held-out test period behind `results`
+  results: StrategyResult[];
 }
 
 /** Real-time quote and its track record; informational, buy/sell/score stay on guide prices. */
@@ -42,6 +76,7 @@ export interface ScanResult {
   liveDate: string | null; // real-time day the live quotes are as of; null when missing or stale
   itemCount: number;
   dbPath: string;
+  strategy: StrategyInfo;
 }
 
 /** `searched` is non-empty only when the database is missing. */

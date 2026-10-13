@@ -1,8 +1,9 @@
-//! The trade rule shared by the app's live estimate and the backtest: one buy offer and one sell
-//! offer at fixed prices, filled against one day of data at a time (docs/backtest.md).
+//! The trade rules shared by the app and the backtests: one buy offer and one sell offer at fixed
+//! prices, filled against one day of data at a time (docs/backtest.md) or one hourly bucket at a
+//! time (`simulate_hourly`, docs/strategy.md).
 
 use crate::flips::ge_tax;
-use crate::model::RtDay;
+use crate::model::{RtDay, RtHour};
 
 /// A buy may fill from the day after the signal, and everything is sold within HORIZON days.
 pub const HORIZON: i64 = 7;
@@ -131,6 +132,117 @@ pub fn rt_path(rt: &[RtDay], t: i64) -> Vec<PathDay> {
         .collect()
 }
 
+/// GE buy limits count the units bought in the 4 hours from the first purchase.
+pub const GE_LIMIT_HOURS: i64 = 4;
+
+/// When an hourly trade may happen, in hours since 1970-01-01 UTC. The signal saw bucket `signal`,
+/// so nothing fills in it or before it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HourWindow {
+    pub signal: i64,
+    pub entry: i64,  // the bid can fill in buckets signal+1 ..= signal+entry
+    pub horizon: i64,  // sales run to bucket signal+horizon, then the rest is dumped
+}
+
+/// Fill assumptions of the hourly simulator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HourlyFills {
+    pub vol_share: f64,  // share of a bucket's volume one buy or one bucket's sales may take
+    pub reenter: bool,  // re-place the bid after a position is sold (else one trip per order)
+    pub dump_discount: f64,  // forced exits get this fraction below the instant-sell average
+}
+
+/// One round trip: a buy fill and the sales (or the dump) that closed it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Trip {
+    pub buy_hour: i64,
+    pub exit_hour: i64,  // bucket of the last sale or the dump
+    pub qty: i64,
+    pub profit: f64,  // realised gp after tax
+    pub forced: i64,  // units dumped at the horizon
+}
+
+struct Position {
+    at: usize,  // index of the buy bucket
+    qty: i64,
+    left: i64,
+    proceeds: f64,
+    last_sale: i64,
+}
+
+/// Simulates round trips at fixed offer prices against hourly buckets (`path` chronological; a
+/// missing bucket had no trades):
+/// - while no units are held, the bid fills at `order.buy` in the first bucket of the entry window
+///   whose instant-sell average is at or below it. It takes at most `vol_share` of that bucket's
+///   instant-sell volume, `order.qty` units, and what is left of the GE limit in the current
+///   4-hour window. A bucket too thin for one unit does not fill;
+/// - from the next bucket the units are offered at `order.sell`; in each bucket whose instant-buy
+///   average reaches the ask, up to `vol_share` of its instant-buy volume sells;
+/// - once everything is sold the bid is live again from the next bucket, inside the entry window
+///   (one position at a time);
+/// - whatever is left after bucket signal+horizon's sales is dumped at that bucket's instant-sell
+///   average, or the latest one since the buy if it has none.
+///
+/// GE tax applies to every sale.
+pub fn simulate_hourly(order: &Order, ge_limit: Option<i32>, window: &HourWindow, fills: &HourlyFills, path: &[RtHour]) -> Vec<Trip> {
+    let mut trips = Vec::new();
+    if order.buy <= 0 || order.qty <= 0 {
+        return trips;
+    }
+    let last_entry = window.signal + window.entry.min(window.horizon);
+    let end = window.signal + window.horizon;
+    let bars = &path[path.partition_point(|b| b.hour <= window.signal)..path.partition_point(|b| b.hour <= end)];
+    let (bid, ask) = (order.buy as f64, order.sell as f64);
+    let net_ask = net_of_tax(order.sell, order.name);
+    let share = |volume: f64| (fills.vol_share * volume).floor() as i64;
+    let mut limit: Option<(i64, i64)> = None;  // (first buy hour, units bought) of the GE-limit window
+    let mut open: Option<Position> = None;
+
+    for (i, b) in bars.iter().enumerate() {
+        if let Some(p) = open.as_mut() {
+            if b.high.is_some_and(|px| px >= ask) {
+                let sold = p.left.min(share(b.high_volume));
+                if sold > 0 {
+                    p.proceeds += sold as f64 * net_ask;
+                    p.left -= sold;
+                    p.last_sale = b.hour;
+                }
+            }
+            if p.left == 0 {
+                let profit = p.proceeds - p.qty as f64 * bid;
+                trips.push(Trip { buy_hour: bars[p.at].hour, exit_hour: p.last_sale, qty: p.qty, profit, forced: 0 });
+                open = None;
+            }
+            continue;
+        }
+        if b.hour > last_entry || (!fills.reenter && !trips.is_empty()) {
+            break;
+        }
+        if !b.low.is_some_and(|px| px <= bid) {
+            continue;
+        }
+        if limit.is_some_and(|(start, _)| b.hour >= start + GE_LIMIT_HOURS) {
+            limit = None;
+        }
+        let (start, used) = limit.unwrap_or((b.hour, 0));
+        let room = ge_limit.map_or(i64::MAX, |l| i64::from(l) - used);
+        let qty = order.qty.min(room).min(share(b.low_volume));
+        if qty > 0 {
+            limit = Some((start, used + qty));
+            open = Some(Position { at: i, qty, left: qty, proceeds: 0.0, last_sale: b.hour });
+        }
+    }
+
+    if let Some(p) = open {
+        // The buy bucket always has an instant-sell price (it reached the bid)
+        let px = bars[p.at..].iter().rev().find_map(|b| b.low).unwrap_or(bid) * (1.0 - fills.dump_discount);
+        let px = px.round().clamp(0.0, i64::MAX as f64) as i64;
+        let proceeds = p.proceeds + p.left as f64 * net_of_tax(px, order.name);
+        trips.push(Trip { buy_hour: bars[p.at].hour, exit_hour: end, qty: p.qty, profit: proceeds - p.qty as f64 * bid, forced: p.left });
+    }
+    trips
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +323,115 @@ mod tests {
         assert_eq!(order_qty(300, None, 1_000.0), 3);
         assert_eq!(order_qty(0, None, 1_000.0), 0);
         assert_eq!(order_qty(1, None, 1e12), i64::from(i32::MAX));
+    }
+
+    // ------------------------------------------------------------ hourly
+
+    const H: i64 = 500_000;
+    const WINDOW: HourWindow = HourWindow { signal: H, entry: 12, horizon: 24 };
+    const FILLS: HourlyFills = HourlyFills { vol_share: 0.1, reenter: true, dump_discount: 0.0 };
+
+    fn bucket(hour: i64, low: Option<f64>, high: Option<f64>, low_volume: f64, high_volume: f64) -> RtHour {
+        RtHour { hour, high, low, high_volume, low_volume }
+    }
+
+    /// A bucket where both sides trade at `low` / `high` with plenty of volume.
+    fn both(hour: i64, low: f64, high: f64) -> RtHour {
+        bucket(hour, Some(low), Some(high), 1e6, 1e6)
+    }
+
+    #[test]
+    fn hourly_fills_need_volume_and_never_happen_in_the_signal_bucket() {
+        let path = [
+            both(H, 90.0, 130.0),  // seen by the signal: ignored even though it crosses
+            bucket(H + 1, Some(95.0), None, 9.0, 0.0),  // 10% of 9 is not one unit
+            bucket(H + 2, Some(99.0), None, 50.0, 0.0),  // buys 5 (10% of 50) at the bid
+            bucket(H + 3, None, Some(130.0), 0.0, 30.0),  // sells 3 at the ask
+            bucket(H + 4, None, Some(125.0), 0.0, 1e6),  // sells the other 2
+        ];
+        let trips = simulate_hourly(&order(100, 125, 10), None, &WINDOW, &FILLS, &path);
+        assert_eq!(trips, vec![Trip { buy_hour: H + 2, exit_hour: H + 4, qty: 5, profit: 5.0 * (125.0 - 2.0 - 100.0), forced: 0 }]);
+        // An ask above every instant-buy average and a bid below every instant-sell average never trade
+        assert_eq!(simulate_hourly(&order(100, 131, 10), None, &WINDOW, &FILLS, &path)[0].forced, 5);
+        assert!(simulate_hourly(&order(94, 125, 10), None, &WINDOW, &FILLS, &path).is_empty());
+    }
+
+    #[test]
+    fn hourly_never_sells_in_the_buy_bucket() {
+        // Both sides cross in the buy bucket; nothing else trades, so the units are dumped
+        let trips = simulate_hourly(&order(100, 125, 10), None, &WINDOW, &FILLS, &[both(H + 1, 99.0, 200.0)]);
+        assert_eq!(trips, vec![Trip { buy_hour: H + 1, exit_hour: H + 24, qty: 10, profit: 10.0 * (99.0 - 1.0 - 100.0), forced: 10 }]);
+    }
+
+    #[test]
+    fn hourly_forced_exit_at_the_horizon_bucket() {
+        let mut path = vec![
+            both(H + 1, 100.0, 110.0),
+            bucket(H + 20, Some(97.0), None, 5.0, 0.0),
+            bucket(H + 24, Some(95.0), Some(120.0), 5.0, 5.0),  // the ask is never reached
+            both(H + 25, 300.0, 300.0),  // after the horizon: ignored
+        ];
+        let o = order(100, 125, 10);
+        let forced = |profit: f64| vec![Trip { buy_hour: H + 1, exit_hour: H + 24, qty: 10, profit, forced: 10 }];
+        // Dumped at the horizon bucket's instant-sell average (95, tax 1)
+        assert_eq!(simulate_hourly(&o, None, &WINDOW, &FILLS, &path), forced(10.0 * (94.0 - 100.0)));
+        // A discount lowers the dump price: 95 * 0.98 = 93.1, rounded to 93 (tax 1)
+        let haircut = HourlyFills { dump_discount: 0.02, ..FILLS };
+        assert_eq!(simulate_hourly(&o, None, &WINDOW, &haircut, &path), forced(10.0 * (92.0 - 100.0)));
+        // Without an instant sale in the horizon bucket: the latest one since the buy (97)
+        path[2].low = None;
+        assert_eq!(simulate_hourly(&o, None, &WINDOW, &FILLS, &path), forced(10.0 * (96.0 - 100.0)));
+    }
+
+    #[test]
+    fn hourly_ge_limit_counts_four_hours_from_the_first_buy() {
+        // Every bucket would fill and sell; the limit of 10 allows one trip per 4-hour window
+        let path: Vec<RtHour> = (H + 1..=H + 24).map(|h| both(h, 100.0, 130.0)).collect();
+        let o = order(100, 125, 1000);
+        let buys = |trips: Vec<Trip>| trips.iter().map(|t| (t.buy_hour - H, t.qty)).collect::<Vec<_>>();
+        assert_eq!(buys(simulate_hourly(&o, Some(10), &WINDOW, &FILLS, &path)), vec![(1, 10), (5, 10), (9, 10)]);
+        // Without a limit: buy, sell, buy again, until the entry window closes after bucket 12
+        let unlimited = simulate_hourly(&o, None, &WINDOW, &FILLS, &path);
+        assert_eq!(buys(unlimited.clone()), vec![(1, 1000), (3, 1000), (5, 1000), (7, 1000), (9, 1000), (11, 1000)]);
+        assert!(unlimited.iter().all(|t| t.exit_hour == t.buy_hour + 1 && t.profit == 1000.0 * 23.0));
+        // One trip per order when re-entry is off
+        let once = HourlyFills { reenter: false, ..FILLS };
+        assert_eq!(buys(simulate_hourly(&o, Some(10), &WINDOW, &once, &path)), vec![(1, 10)]);
+        // A partly used window leaves the rest of the limit: 6 bought, 4 left within the window
+        let thin = [bucket(H + 1, Some(100.0), None, 60.0, 0.0), both(H + 2, 100.0, 130.0), both(H + 3, 100.0, 130.0)];
+        assert_eq!(buys(simulate_hourly(&o, Some(10), &WINDOW, &FILLS, &thin)), vec![(1, 6), (3, 4)]);
+    }
+
+    #[test]
+    fn hourly_entry_window_and_sales_after_it() {
+        let path = [bucket(H + 13, Some(90.0), None, 1e6, 0.0)];
+        assert!(simulate_hourly(&order(100, 125, 10), None, &WINDOW, &FILLS, &path).is_empty());
+        // Bought in the last entry bucket, sold well after it
+        let path = [bucket(H + 12, Some(100.0), None, 1e6, 0.0), bucket(H + 20, None, Some(126.0), 0.0, 1e6)];
+        let trips = simulate_hourly(&order(100, 125, 10), None, &WINDOW, &FILLS, &path);
+        assert_eq!(trips, vec![Trip { buy_hour: H + 12, exit_hour: H + 20, qty: 10, profit: 230.0, forced: 0 }]);
+    }
+
+    #[test]
+    fn hourly_tax_applies_to_sales_and_dumps_except_bonds() {
+        let path = [both(H + 1, 100.0, 100.0), both(H + 2, 150.0, 200.0)];
+        let sell = |name| simulate_hourly(&Order { buy: 100, sell: 200, qty: 1, name }, None, &WINDOW, &FILLS, &path)[0].profit;
+        assert_eq!((sell("Coal"), sell("Bond")), (96.0, 100.0));
+        let dump = |name| simulate_hourly(&Order { buy: 100, sell: 900, qty: 1, name }, None, &WINDOW, &FILLS, &path)[0].profit;
+        assert_eq!((dump("Coal"), dump("Bond")), (147.0 - 100.0, 150.0 - 100.0));
+    }
+
+    #[test]
+    fn hourly_ignores_buckets_outside_the_window() {
+        let inside: Vec<RtHour> = (1..=24)
+            .map(|i| bucket(H + i, Some(98.0 + (i % 5) as f64), Some(120.0 + (i % 7) as f64 * 2.0), 40.0 + i as f64, 35.0))
+            .collect();
+        let o = order(100, 125, 1000);
+        let before = simulate_hourly(&o, Some(20), &WINDOW, &FILLS, &inside);
+        assert!(!before.is_empty());
+        let mut path = vec![both(H - 1, 1.0, 1e9), both(H, 1.0, 1e9)];
+        path.extend(inside.iter().copied());
+        path.extend((25..30).map(|i| both(H + i, 1.0, 1e9)));
+        assert_eq!(simulate_hourly(&o, Some(20), &WINDOW, &FILLS, &path), before);
     }
 }

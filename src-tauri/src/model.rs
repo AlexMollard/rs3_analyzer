@@ -37,6 +37,17 @@ pub struct RtDay {
     pub low_volume: f64,
 }
 
+/// One hourly bucket of an item's real-time averages (rt_hourly). Prices are None when that side
+/// did not trade; a missing bucket means the item did not trade that hour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtHour {
+    pub hour: i64,  // hours since 1970-01-01 00:00 UTC (bucket start / 3600)
+    pub high: Option<f64>,  // average instant-buy price
+    pub low: Option<f64>,  // average instant-sell price
+    pub high_volume: f64,
+    pub low_volume: f64,
+}
+
 /// Headline risk, in priority order (same order the notes prefix uses)
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]

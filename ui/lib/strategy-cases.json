@@ -1,0 +1,9 @@
+[
+  {"budget": 50000000, "buy": 9800, "geLimit": 100, "liquidity": 1000, "qty": 100, "capacity": 100},
+  {"budget": 50000000, "buy": 879, "geLimit": 25000, "liquidity": 39128.5, "qty": 5688, "capacity": 3912},
+  {"budget": 10000000, "buy": 3550717, "geLimit": 10, "liquidity": 12, "qty": 0, "capacity": 0},
+  {"budget": 50000000, "buy": 3550717, "geLimit": 10, "liquidity": 12, "qty": 1, "capacity": 1},
+  {"budget": 250000000, "buy": 120, "geLimit": null, "liquidity": 9.5, "qty": 208333, "capacity": 0},
+  {"budget": 1000000, "buy": 100, "geLimit": 25000, "liquidity": 1000000, "qty": 1000, "capacity": 1000},
+  {"budget": 50000000000, "buy": 1, "geLimit": null, "liquidity": 1e12, "qty": 2147483647, "capacity": 2147483647}
+]

@@ -6,7 +6,8 @@
 
 use crate::commands::tier_code;
 use crate::flips::{analyze, ge_tax, live_estimate, live_quote, median, track_record};
-use crate::loader::{RtRow, load_all_snapshots, load_rt};
+use crate::hourly::{ENTRY_HOURS, HORIZON_HOURS, capacity, daily_pick, signal_bucket};
+use crate::loader::{ItemHours, RtRow, load_all_snapshots, load_rt, load_rt_hourly};
 use crate::model::{ItemSnapshot, Risk};
 use crate::stats::{day_number, item_stats};
 use crate::trade::{rt_path, rt_window};
@@ -21,8 +22,14 @@ pub const TIERS: [&str; 5] = ["S", "A", "B", "C", "X"];
 
 // ---------------------------------------------------------------- data
 
-pub use crate::model::RtDay;
-pub use crate::trade::{HORIZON, Order, Outcome, PathDay, VOLUME_SHARE, order_qty, simulate};
+pub use crate::hourly::{
+    ENTRY_HOURS as HOURLY_ENTRY, HORIZON_HOURS as HOURLY_HORIZON, HourlyQuote, HourlyRule, Pricing, RULES as HOURLY_RULES,
+    signal_bucket as hourly_signal_bucket,
+};
+pub use crate::model::{RtDay, RtHour};
+pub use crate::trade::{
+    HORIZON, HourWindow, HourlyFills, Order, Outcome, PathDay, Trip, VOLUME_SHARE, order_qty, simulate, simulate_hourly,
+};
 
 /// One item's full history in chronological order.
 pub struct Series {
@@ -32,6 +39,7 @@ pub struct Series {
     pub snaps: Vec<ItemSnapshot>,
     pub days: Vec<i64>,  // day number of each snapshot
     pub rt: Vec<RtDay>,
+    pub hours: Vec<RtHour>,  // real-time hourly buckets (only loaded for the hourly study)
 }
 
 impl Series {
@@ -73,6 +81,7 @@ pub fn build_series(snaps: Vec<ItemSnapshot>, rt: Vec<RtRow>) -> (Vec<Series>, u
                 snaps: Vec::new(),
                 days: Vec::new(),
                 rt: Vec::new(),
+                hours: Vec::new(),
             });
         }
         let series = out.last_mut().unwrap();
@@ -99,15 +108,57 @@ pub struct Coverage {
     pub rt_items: usize,
     pub rt_rows: usize,
     pub rt_days: Option<(i64, i64)>,
+    pub hourly: Option<HourlyCoverage>,
     pub skipped_rows: usize,
 }
 
-/// Loads every history and real-time row (read-only).
-pub fn load(db: &Path) -> Result<(Vec<Series>, Coverage), String> {
+/// The rt_hourly rows that belong to items with guide history (the ones the study can trade).
+pub struct HourlyCoverage {
+    pub rows: usize,
+    pub items: usize,
+    pub hours: usize,  // distinct buckets
+    pub range: (i64, i64),  // first and last bucket, hours since 1970-01-01 UTC
+    pub dropped_items: usize,  // items with hourly rows but no guide history
+}
+
+/// Attaches each item's hourly buckets. Returns the number of items without a series.
+pub fn attach_hours(series: &mut [Series], hourly: Vec<ItemHours>) -> usize {
+    let index: HashMap<i32, usize> = series.iter().enumerate().map(|(i, s)| (s.item_id, i)).collect();
+    let mut dropped = 0;
+    for (item_id, hours) in hourly {
+        match index.get(&item_id) {
+            Some(&i) => series[i].hours = hours,
+            None => dropped += 1,
+        }
+    }
+    dropped
+}
+
+/// Loads every history and real-time row (read-only); rt_hourly too when `hourly` is set.
+pub fn load(db: &Path, hourly: bool) -> Result<(Vec<Series>, Coverage), String> {
     let (snaps, skipped_history) = load_all_snapshots(db).map_err(|e| format!("history: {}", e))?;
     let (rt, skipped_rt) = load_rt(db, None).map_err(|e| format!("rt_daily: {}", e))?;
     let (history_rows, rt_rows) = (snaps.len(), rt.len());
-    let (series, bad) = build_series(snaps, rt);
+    let (mut series, bad) = build_series(snaps, rt);
+    let mut skipped_hourly = 0;
+    let hourly = if hourly {
+        let (rows, skipped) = load_rt_hourly(db, None).map_err(|e| format!("rt_hourly: {}", e))?;
+        skipped_hourly = skipped;
+        let dropped_items = attach_hours(&mut series, rows);
+        let all = series.iter().flat_map(|s| s.hours.iter().map(|b| b.hour));
+        let mut distinct: Vec<i64> = all.clone().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        Some(HourlyCoverage {
+            rows: series.iter().map(|s| s.hours.len()).sum(),
+            items: series.iter().filter(|s| !s.hours.is_empty()).count(),
+            hours: distinct.len(),
+            range: all.clone().min().zip(all.max()).unwrap_or((0, 0)),
+            dropped_items,
+        })
+    } else {
+        None
+    };
     let days = series.iter().flat_map(|s| [s.days.first(), s.days.last()]).flatten();
     let history_days = (days.clone().copied().min().unwrap_or(0), days.copied().max().unwrap_or(0));
     let rt_all = series.iter().flat_map(|s| s.rt.iter().map(|r| r.day));
@@ -119,7 +170,8 @@ pub fn load(db: &Path) -> Result<(Vec<Series>, Coverage), String> {
         rt_items: series.iter().filter(|s| !s.rt.is_empty()).count(),
         rt_rows,
         rt_days,
-        skipped_rows: skipped_history + skipped_rt + bad,
+        hourly,
+        skipped_rows: skipped_history + skipped_rt + skipped_hourly + bad,
     };
     Ok((series, coverage))
 }
@@ -818,6 +870,237 @@ pub fn compare(base: &[DayResult], cand: &[DayResult], ki: usize, step: i64) -> 
     }
 }
 
+// ---------------------------------------------------------------- hourly study (docs/strategy.md)
+
+/// Settings of the hourly study; the cohort timing is fixed in crate::hourly.
+pub struct HourlyConfig {
+    pub budgets: Vec<f64>,
+    pub k: usize,
+    pub fills: HourlyFills,
+    pub days: Vec<i64>,  // signal days (days since 1970-01-01, UTC)
+}
+
+/// One rule at one budget on one signal day: the top-K picks and every trip they made.
+#[derive(Debug, Clone, Default)]
+pub struct HourlyDay {
+    pub day: i64,
+    pub picks: usize,
+    pub no_limit: usize,  // picks without a known GE limit (uncapped)
+    pub filled: usize,  // picks with at least one trip
+    pub trips: Vec<(i32, Trip)>,  // (item id, trip)
+}
+
+impl HourlyDay {
+    pub fn pnl(&self) -> f64 {
+        self.trips.iter().map(|(_, t)| t.profit).sum()
+    }
+}
+
+/// The guide-price crash flag for health check (c), from guide rows dated on or before `day`.
+/// Items without guide rows count as flagged.
+fn crash_flagged(s: &Series, day: i64) -> bool {
+    baseline_signal(s, day).is_none_or(|b| b.crash)
+}
+
+/// The rule's tradable quote for an item on signal day `day` (data up to the signal bucket only;
+/// the crash flag from guide prices dated before `day`).
+pub fn hourly_signal(s: &Series, rule: &HourlyRule, day: i64) -> Option<HourlyQuote> {
+    daily_pick(&s.hours, s.hours.first().map(|b| b.hour), day, rule, &s.name, || crash_flagged(s, day - 1))
+}
+
+/// Results indexed [rule][budget][day].
+pub fn evaluate_hourly(series: &[Series], rules: &[HourlyRule], cfg: &HourlyConfig) -> Vec<Vec<Vec<HourlyDay>>> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = cfg.days.len().div_ceil(threads).max(1);
+    let mut by_day: Vec<Vec<Vec<HourlyDay>>> = Vec::with_capacity(cfg.days.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = cfg
+            .days
+            .chunks(chunk)
+            .map(|days| scope.spawn(move || days.iter().map(|&d| hourly_day(series, rules, cfg, d)).collect::<Vec<_>>()))
+            .collect();
+        for h in handles {
+            by_day.extend(h.join().expect("evaluation thread panicked"));
+        }
+    });
+    (0..rules.len())
+        .map(|ri| (0..cfg.budgets.len()).map(|bi| by_day.iter().map(|d| d[ri][bi].clone()).collect()).collect())
+        .collect()
+}
+
+fn hourly_day(series: &[Series], rules: &[HourlyRule], cfg: &HourlyConfig, day: i64) -> Vec<Vec<HourlyDay>> {
+    let window = HourWindow { signal: signal_bucket(day), entry: ENTRY_HOURS, horizon: HORIZON_HOURS };
+    rules
+        .iter()
+        .map(|rule| {
+            let quotes: Vec<(usize, HourlyQuote)> = series
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.hours.is_empty())
+                .filter_map(|(i, s)| hourly_signal(s, rule, day).map(|q| (i, q)))
+                .collect();
+            cfg.budgets
+                .iter()
+                .map(|&budget| {
+                    let alloc = budget / cfg.k as f64;
+                    let mut cands: Vec<(f64, usize, &HourlyQuote)> = quotes
+                        .iter()
+                        .filter_map(|(i, q)| {
+                            let cap = capacity(q, series[*i].ge_limit, alloc);
+                            (cap >= 1).then_some((q.margin * cap as f64, *i, q))
+                        })
+                        .collect();
+                    // Highest expected round-trip profit first; the item id breaks ties
+                    cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(series[a.1].item_id.cmp(&series[b.1].item_id)));
+                    let mut r = HourlyDay { day, ..Default::default() };
+                    for &(_, i, q) in cands.iter().take(cfg.k) {
+                        let s = &series[i];
+                        let order = Order { buy: q.buy, sell: q.sell, qty: order_qty(q.buy, s.ge_limit, alloc), name: &s.name };
+                        let trips = simulate_hourly(&order, s.ge_limit, &window, &cfg.fills, &s.hours);
+                        r.picks += 1;
+                        r.no_limit += usize::from(s.ge_limit.is_none());
+                        r.filled += usize::from(!trips.is_empty());
+                        r.trips.extend(trips.into_iter().map(|t| (s.item_id, t)));
+                    }
+                    r
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Bootstrap block length in signal days for the hourly study's intervals.
+pub const HOURLY_BLOCK: usize = 3;
+
+pub struct HourlySummary {
+    pub days: usize,
+    pub picks: usize,
+    pub no_limit: usize,
+    pub filled: usize,
+    pub trips: usize,
+    pub wins: usize,
+    pub win_rate: f64,  // profitable trips / trips
+    pub win_rate_ci: (f64, f64),  // day-block bootstrap of pooled wins / pooled trips
+    pub profit_day: f64,  // mean day P&L over every signal day (0 when nothing traded)
+    pub profit_day_ci: (f64, f64),
+    pub median_day: f64,
+    pub mean_trip: f64,
+    pub median_trip: f64,
+    pub trade_days: f64,  // share of days with at least one trip
+    pub max_drawdown: f64,  // of cumulative day P&L
+    pub worst10_share: f64,  // the 10 worst trips' share of all losses
+    pub forced_share: f64,  // units dumped at the horizon / units bought
+    pub items: usize,  // distinct items traded
+    pub top_item_trips: f64,  // the busiest item's share of trips
+    pub top_item_profit: f64,  // the most profitable item's share of total profit (when positive)
+}
+
+pub fn summarize_hourly(days: &[HourlyDay]) -> HourlySummary {
+    let pnl: Vec<f64> = days.iter().map(HourlyDay::pnl).collect();
+    let wins: Vec<f64> = days.iter().map(|d| d.trips.iter().filter(|(_, t)| t.profit > 0.0).count() as f64).collect();
+    let counts: Vec<f64> = days.iter().map(|d| d.trips.len() as f64).collect();
+    let trips: Vec<(i32, Trip)> = days.iter().flat_map(|d| d.trips.iter().copied()).collect();
+    let profits: Vec<f64> = trips.iter().map(|(_, t)| t.profit).collect();
+    let total: f64 = profits.iter().sum();
+    let mut losses: Vec<f64> = profits.iter().copied().filter(|p| *p < 0.0).collect();
+    losses.sort_by(f64::total_cmp);
+    let loss_total: f64 = losses.iter().sum();
+    let mut by_item: HashMap<i32, (usize, f64)> = HashMap::new();
+    for (id, t) in &trips {
+        let e = by_item.entry(*id).or_default();
+        e.0 += 1;
+        e.1 += t.profit;
+    }
+    let pick = |idx: &[usize], v: &[f64]| idx.iter().map(|&i| v[i]).sum::<f64>();
+    let n_wins = wins.iter().sum::<f64>() as usize;
+    let bought: i64 = trips.iter().map(|(_, t)| t.qty).sum();
+    HourlySummary {
+        days: days.len(),
+        picks: days.iter().map(|d| d.picks).sum(),
+        no_limit: days.iter().map(|d| d.no_limit).sum(),
+        filled: days.iter().map(|d| d.filled).sum(),
+        trips: trips.len(),
+        wins: n_wins,
+        win_rate: ratio(n_wins, trips.len()),
+        win_rate_ci: bootstrap(days.len(), HOURLY_BLOCK, |idx| pick(idx, &wins) / pick(idx, &counts)),
+        profit_day: mean(&pnl),
+        profit_day_ci: bootstrap(days.len(), HOURLY_BLOCK, |idx| pick(idx, &pnl) / idx.len() as f64),
+        median_day: median(pnl.clone()),
+        mean_trip: mean(&profits),
+        median_trip: median(profits.clone()),
+        trade_days: ratio(counts.iter().filter(|&&c| c > 0.0).count(), days.len()),
+        max_drawdown: max_drawdown(pnl.iter().copied()),
+        worst10_share: if loss_total < 0.0 { losses.iter().take(10).sum::<f64>() / loss_total } else { f64::NAN },
+        forced_share: trips.iter().map(|(_, t)| t.forced).sum::<i64>() as f64 / bought as f64,
+        items: by_item.len(),
+        top_item_trips: ratio(by_item.values().map(|v| v.0).max().unwrap_or(0), trips.len()),
+        top_item_profit: if total > 0.0 { by_item.values().map(|v| v.1).fold(f64::MIN, f64::max) / total } else { f64::NAN },
+    }
+}
+
+/// Minimum activity for the selection rule (docs/strategy-plan.md).
+pub const MIN_TRAIN_TRIPS: usize = 100;
+pub const MIN_VALIDATION_TRIPS: usize = 40;
+pub const MIN_TRADE_DAYS: f64 = 0.5;
+/// The bar: win rate and profit/day both judged on top-K at the decision budget.
+pub const MIN_WIN_RATE: f64 = 0.70;
+
+/// How a rule fared under the selection rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Ineligible,
+    Eligible,
+    Qualified,
+}
+
+pub fn standing(train: &HourlySummary, validation: &HourlySummary) -> Standing {
+    let eligible = train.trips >= MIN_TRAIN_TRIPS
+        && validation.trips >= MIN_VALIDATION_TRIPS
+        && train.trade_days >= MIN_TRADE_DAYS
+        && validation.trade_days >= MIN_TRADE_DAYS;
+    let passes = |s: &HourlySummary| s.win_rate >= MIN_WIN_RATE && s.profit_day > 0.0;
+    match (eligible, passes(train) && passes(validation)) {
+        (false, _) => Standing::Ineligible,
+        (true, false) => Standing::Eligible,
+        (true, true) => Standing::Qualified,
+    }
+}
+
+/// The pre-registered selection: the chosen rule and the runner-up (indexes into the summaries),
+/// with whether each qualified. Qualified rules rank by validation profit/day; empty slots fall
+/// back to eligible rules with positive validation profit/day, then any eligible rule, by
+/// validation win rate (ties: validation profit/day).
+pub fn select_hourly(train: &[&HourlySummary], validation: &[&HourlySummary]) -> Vec<(usize, bool)> {
+    let standings: Vec<Standing> = train.iter().zip(validation).map(|(t, v)| standing(t, v)).collect();
+    let by = |key: fn(&HourlySummary) -> (f64, f64), filter: &dyn Fn(usize) -> bool| {
+        let mut idx: Vec<usize> = (0..validation.len()).filter(|&i| filter(i)).collect();
+        idx.sort_by(|&a, &b| {
+            let (ka, kb) = (key(validation[a]), key(validation[b]));
+            kb.0.total_cmp(&ka.0).then(kb.1.total_cmp(&ka.1)).then(a.cmp(&b))
+        });
+        idx
+    };
+    let mut picks: Vec<(usize, bool)> = by(|v| (v.profit_day, v.win_rate), &|i| standings[i] == Standing::Qualified)
+        .into_iter()
+        .take(2)
+        .map(|i| (i, true))
+        .collect();
+    let eligible = |i: usize| standings[i] != Standing::Ineligible;
+    let fallbacks = [
+        by(|v| (v.win_rate, v.profit_day), &|i| eligible(i) && validation[i].profit_day > 0.0),
+        by(|v| (v.win_rate, v.profit_day), &eligible),
+    ];
+    for i in fallbacks.into_iter().flatten() {
+        if picks.len() == 2 {
+            break;
+        }
+        if !picks.iter().any(|p| p.0 == i) {
+            picks.push((i, false));
+        }
+    }
+    picks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,6 +1220,124 @@ mod tests {
         assert!(summary.ks[0].mean_rate > 0.0);  // K=1 picks the higher-scored swing item
         let delta = compare(days, days, 0, 1);
         assert_eq!((delta.sharpe, delta.pnl_day), (0.0, 0.0));
+    }
+
+    /// A series with 120 days of flat guide prices and two weeks of hourly buckets before `day`
+    /// plus the signal day itself: instant sells at 1,000, instant buys at 1,100.
+    fn hourly_series(item_id: i32, day: i64) -> Series {
+        let mut s = synthetic(item_id, 200, |_| 1050);
+        let start = signal_bucket(day) - 335;
+        s.hours = (start..=signal_bucket(day) + 24)
+            .map(|h| RtHour { hour: h, high: Some(1100.0), low: Some(1000.0), high_volume: 500.0, low_volume: 500.0 })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn hourly_signals_never_see_buckets_after_the_signal() {
+        let day = day_number("2026-06-01").unwrap();
+        let mut s = hourly_series(1, day);
+        let h = signal_bucket(day);
+        for b in s.hours.iter_mut().filter(|b| b.hour < h) {
+            b.low = Some(1000.0 + (b.hour % 7) as f64);  // some spread so every rule quotes
+            b.high = Some(1100.0 + (b.hour % 5) as f64);
+        }
+        let before: Vec<Option<HourlyQuote>> = HOURLY_RULES.iter().map(|r| hourly_signal(&s, r, day)).collect();
+        assert!(before[0].is_some() && before[4].is_some());
+        for b in s.hours.iter_mut().filter(|b| b.hour > h) {
+            *b = RtHour { hour: b.hour, high: Some(1e9), low: Some(1.0), high_volume: 1e9, low_volume: 1e9 };
+        }
+        for snap in s.snaps.iter_mut().zip(&s.days).filter(|(_, d)| **d >= day).map(|(x, _)| x) {
+            snap.price = 1;
+        }
+        let after: Vec<Option<HourlyQuote>> = HOURLY_RULES.iter().map(|r| hourly_signal(&s, r, day)).collect();
+        assert_eq!(after, before);
+        assert_eq!(h % 24, 23);  // 23:00 UTC the day before
+    }
+
+    #[test]
+    fn hourly_evaluation_end_to_end() {
+        let day = day_number("2026-06-01").unwrap();
+        // Item 1 buys at 1,000 in the first bucket and sells at 1,100 in the next, every time;
+        // item 2 never reaches its ask after the signal, so its trip is dumped at a loss
+        let one = hourly_series(1, day);
+        let mut two = hourly_series(2, day);
+        for b in two.hours.iter_mut().filter(|b| b.hour > signal_bucket(day)) {
+            b.high = Some(1050.0);
+        }
+        let series = vec![one, two];
+        let flip = HOURLY_RULES[0];
+        let cfg = HourlyConfig {
+            budgets: vec![50_000_000.0],
+            k: 10,
+            fills: HourlyFills { vol_share: 0.1, reenter: true, dump_discount: 0.0 },
+            days: vec![day],
+        };
+        let r = &evaluate_hourly(&series, &[flip], &cfg)[0][0][0];
+        // GE limit 100 per 4 hours (synthetic), 50 units a trip (10% of 500): item 1 trades
+        // 50+50 in each 4-hour window of the 12-hour entry window
+        assert_eq!((r.picks, r.filled, r.no_limit), (2, 2, 0));
+        let one: Vec<&Trip> = r.trips.iter().filter(|(id, _)| *id == 1).map(|(_, t)| t).collect();
+        assert!(one.iter().all(|t| t.qty == 50 && t.profit == 50.0 * (1100.0 - 22.0 - 1000.0)));
+        let two: Vec<&Trip> = r.trips.iter().filter(|(id, _)| *id == 2).map(|(_, t)| t).collect();
+        assert_eq!(two.len(), 1);
+        assert_eq!((two[0].forced, two[0].profit), (50, 50.0 * (1000.0 - 20.0 - 1000.0)));
+        let s = summarize_hourly(std::slice::from_ref(r));
+        assert_eq!((s.trips, s.wins, s.items), (one.len() + 1, one.len(), 2));
+        assert_eq!(s.profit_day, r.pnl());
+        assert_eq!(s.worst10_share, 1.0);
+        assert!((s.forced_share - 50.0 / (50.0 * (one.len() + 1) as f64)).abs() < 1e-12);
+    }
+
+    fn summary(trips: usize, win_rate: f64, profit_day: f64, trade_days: f64) -> HourlySummary {
+        HourlySummary {
+            days: 15,
+            picks: 150,
+            no_limit: 0,
+            filled: 100,
+            trips,
+            wins: (trips as f64 * win_rate) as usize,
+            win_rate,
+            win_rate_ci: (f64::NAN, f64::NAN),
+            profit_day,
+            profit_day_ci: (f64::NAN, f64::NAN),
+            median_day: profit_day,
+            mean_trip: 0.0,
+            median_trip: 0.0,
+            trade_days,
+            max_drawdown: 0.0,
+            worst10_share: f64::NAN,
+            forced_share: 0.0,
+            items: 10,
+            top_item_trips: 0.1,
+            top_item_profit: 0.1,
+        }
+    }
+
+    #[test]
+    fn hourly_selection_follows_the_plan() {
+        let train = [
+            summary(500, 0.80, 5e5, 1.0),  // qualified
+            summary(500, 0.75, 9e5, 1.0),  // qualified, best validation profit
+            summary(500, 0.90, 1e6, 1.0),  // validation win rate below 70%
+            summary(50, 0.95, 1e6, 1.0),   // too few train trades
+        ];
+        let valid = [summary(60, 0.72, 1e5, 0.8), summary(60, 0.71, 3e5, 0.8), summary(60, 0.65, 5e5, 0.9), summary(60, 0.99, 1e7, 1.0)];
+        fn refs(v: &[HourlySummary]) -> Vec<&HourlySummary> {
+            v.iter().collect()
+        }
+        assert_eq!(standing(&train[2], &valid[2]), Standing::Eligible);
+        assert_eq!(standing(&train[3], &valid[3]), Standing::Ineligible);
+        assert_eq!(select_hourly(&refs(&train), &refs(&valid)), vec![(1, true), (0, true)]);
+        // One qualified: the runner-up is the eligible one with positive validation profit and the best win rate
+        assert_eq!(select_hourly(&refs(&train[1..]), &refs(&valid[1..])), vec![(0, true), (1, false)]);
+        // None qualified, none profitable on validation: best validation win rate among eligible
+        let losing = [summary(500, 0.5, -1.0, 1.0), summary(500, 0.6, -2.0, 1.0)];
+        let losing_v = [summary(60, 0.40, -5.0, 1.0), summary(60, 0.45, -9.0, 1.0)];
+        assert_eq!(select_hourly(&refs(&losing), &refs(&losing_v)), vec![(1, false), (0, false)]);
+        // Days with trades below half: not eligible, so nothing is selected
+        let idle = [summary(500, 0.9, 1.0, 0.4)];
+        assert!(select_hourly(&refs(&idle), &refs(&[summary(60, 0.9, 1.0, 0.9)])).is_empty());
     }
 
     #[test]

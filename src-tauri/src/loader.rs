@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OpenFlags, Result};
-use crate::model::{ItemSnapshot, RtDay};
+use crate::model::{ItemSnapshot, RtDay, RtHour};
 use crate::stats::day_number;
+use std::collections::HashMap;
 use std::path::Path;
 
 // Read-only: never create an empty database when the file is missing
@@ -134,6 +135,89 @@ pub fn load_rt(db_path: impl AsRef<Path>, days: Option<i64>) -> Result<(Vec<RtRo
     })?;
 
     Ok(collect_rows(rows, "load_rt"))
+}
+
+/// One item's hourly buckets in chronological order.
+pub type ItemHours = (i32, Vec<RtHour>);
+
+fn has_rt_hourly(conn: &Connection) -> Result<bool> {
+    conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rt_hourly')", [], |row| {
+        row.get(0)
+    })
+}
+
+/// Real-time hourly buckets grouped by item. With `since` (unix seconds), only buckets from then
+/// on, and only for items in the items table. Empty for databases created before the rt_hourly
+/// table existed.
+pub fn load_rt_hourly(db_path: impl AsRef<Path>, since: Option<i64>) -> Result<(Vec<ItemHours>, usize)> {
+    let conn = open_db(db_path.as_ref())?;
+    if !has_rt_hourly(&conn)? {
+        return Ok((Vec::new(), 0));
+    }
+
+    let mut stmt = match since {
+        // CROSS JOIN keeps items as the outer loop, so each item is one primary-key range seek and
+        // the app's recent window stays fast as the table grows (`WHERE ts >= ?` scans all of it)
+        Some(_) => conn.prepare(
+            "SELECT r.item_id, r.ts, r.avg_high, r.avg_low, r.high_volume, r.low_volume
+             FROM items i CROSS JOIN rt_hourly r ON r.item_id = i.id AND r.ts >= ?1
+             ORDER BY i.id, r.ts",
+        )?,
+        // The full load streams the table in key order instead of sorting it
+        None => conn.prepare("SELECT item_id, ts, avg_high, avg_low, high_volume, low_volume FROM rt_hourly ORDER BY item_id, ts")?,
+    };
+    let read = |row: &rusqlite::Row| -> Result<(i32, RtHour)> {
+        Ok((
+            row.get(0)?,
+            RtHour {
+                hour: row.get::<_, i64>(1)?.div_euclid(3600),
+                high: row.get(2)?,
+                low: row.get(3)?,
+                high_volume: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64,
+                low_volume: row.get::<_, Option<i64>>(5)?.unwrap_or(0) as f64,
+            },
+        ))
+    };
+    let rows = match since {
+        Some(ts) => stmt.query_map([ts], read)?,
+        None => stmt.query_map([], read)?,
+    };
+
+    // Grouped while streaming: the full table is millions of rows
+    let mut out: Vec<ItemHours> = Vec::new();
+    let (_, errors) = collect_rows(
+        rows.map(|row| {
+            row.map(|(item_id, hour)| match out.last_mut() {
+                Some((id, hours)) if *id == item_id => hours.push(hour),
+                _ => out.push((item_id, vec![hour])),
+            })
+        }),
+        "load_rt_hourly",
+    );
+    Ok((out, errors))
+}
+
+/// The hour index (unix hours) of the newest stored bucket; None without hourly data.
+pub fn newest_rt_hour(db_path: impl AsRef<Path>) -> Result<Option<i64>> {
+    let conn = open_db(db_path.as_ref())?;
+    if !has_rt_hourly(&conn)? {
+        return Ok(None);
+    }
+    let ts: Option<i64> = conn.query_row("SELECT MAX(ts) FROM rt_hourly", [], |row| row.get(0))?;
+    Ok(ts.map(|ts| ts.div_euclid(3600)))
+}
+
+/// The hour index of each item's first stored bucket, for items in the items table (one index
+/// seek each). The hourly strategy's age check needs it when only a recent window is loaded.
+pub fn first_rt_hours(db_path: impl AsRef<Path>) -> Result<HashMap<i32, i64>> {
+    let conn = open_db(db_path.as_ref())?;
+    if !has_rt_hourly(&conn)? {
+        return Ok(HashMap::new());
+    }
+    let mut stmt = conn.prepare("SELECT i.id, (SELECT MIN(ts) FROM rt_hourly WHERE item_id = i.id) FROM items i")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, Option<i64>>(1)?)))?;
+    let (pairs, _) = collect_rows(rows, "first_rt_hours");
+    Ok(pairs.into_iter().filter_map(|(id, ts)| Some((id, ts?.div_euclid(3600)))).collect())
 }
 
 #[derive(serde::Serialize)]

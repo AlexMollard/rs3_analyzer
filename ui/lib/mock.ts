@@ -1,6 +1,6 @@
 // Dev-only fake backend (loaded via ?mock). Deterministic so screenshots are repeatable.
 // ?mock=missing simulates a missing database.
-import type { Backend, FlipRow, HistoryPoint, Risk, ScanError, Tier } from './types.ts';
+import type { Backend, FlipRow, HistoryPoint, Risk, ScanError, StrategyInfo, Tier } from './types.ts';
 
 const BASE_NAMES = [
   'Abyssal whip', 'Saradomin brew flask (6)', 'Super restore flask (6)', 'Dragon bones', 'Elder rune bar',
@@ -40,6 +40,7 @@ function priceSeries(itemId: number, days: number, base: number, trend: number):
 
 function makeRows(): FlipRow[] {
   const rand = rng(42);
+  const srand = rng(4242);
   const rows: FlipRow[] = [];
   let id = 1;
   for (const variant of VARIANTS) {
@@ -59,6 +60,19 @@ function makeRows(): FlipRow[] {
         const liveBuy = Math.round(buy * (1 + (rand() - 0.3) * 0.08));
         const liveSell = Math.round(liveBuy * (1 + (rand() - 0.25) * 0.1));
         const samples = Math.floor(rand() * 22);
+        // About a quarter of items pass the hourly strategy's filters (own generator, so the
+        // other fields stay as they were)
+        const bid = Math.round(buy * (0.97 + srand() * 0.04));
+        const ask = Math.round(bid * (1.03 + srand() * 0.06));
+        const strategy =
+          srand() < 0.25
+            ? {
+                buy: bid,
+                sell: ask,
+                margin: ask - bid - (name.startsWith('Bond') ? 0 : Math.floor(ask / 50)),
+                liquidity: Math.round(10 ** (srand() * 4) * 2) / 2,
+              }
+            : null;
         const live =
           rand() < 0.35
             ? null
@@ -90,11 +104,46 @@ function makeRows(): FlipRow[] {
           notes: `Vol:${Math.round(margin * 100 + 5)}% | Spread:${sell - buy}gp | Q5-Q95:${Math.round(buy * 0.95)}-${Math.round(sell * 1.05)} | Data:90pts`,
           spark: priceSeries(itemId, 30, (buy + sell) / 2, trend),
           live,
+          strategy,
         });
       }
     }
   }
   return rows;
+}
+
+/**
+ * Today's targets (UTC), so the schedule shows where "now" falls, with the real held-out results
+ * (STRATEGY_RESULTS in commands.rs). ?mock&strategy=stale dates the targets two days back,
+ * ?mock&strategy=none drops the hourly data, and ?mock&experimental shows the not-validated variant.
+ */
+function mockStrategy(): StrategyInfo {
+  const params = new URLSearchParams(location.search);
+  const back = params.get('strategy') === 'stale' ? 2 : 0;
+  const today = new Date(Date.now() - back * 86_400_000).toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - (back + 1) * 86_400_000).toISOString().slice(0, 10);
+  const none = params.get('strategy') === 'none';
+  const result = (budget: number, trips: number, winRate: number, winCi: [number, number], profitDay: number, profitCi: [number, number]) => ({
+    budget, trips, winRate, winCi, profitDay, profitCi,
+  });
+  return {
+    name: 'cons24-h',
+    description:
+      'Bid at the 25th percentile of the last 24 hourly instant-sell prices and ask at the 40th percentile of the instant-buy prices, on items that trade both ways most hours, clear at least 1% after tax and pass the market-health checks.',
+    validated: !params.has('experimental'),
+    signalDate: none ? null : today,
+    dataThrough: none ? null : `${yesterday} 23:00`,
+    signalHour: 0,
+    entryHours: 12,
+    horizonHours: 24,
+    picks: 10,
+    testDays: '2026-09-24 to 2026-10-12',
+    results: [
+      result(10_000_000, 223, 0.843, [0.818, 0.874], 392_700, [239_000, 586_600]),
+      result(50_000_000, 209, 0.861, [0.816, 0.89], 935_800, [592_800, 1_260_000]),
+      result(250_000_000, 195, 0.862, [0.818, 0.893], 1_290_000, [296_900, 2_100_000]),
+    ],
+  };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -121,7 +170,15 @@ export const mockBackend: Backend = {
       throw err;
     }
     rows ??= makeRows();
-    return { rows, skippedRows: 0, snapshotDate: '2026-10-12', liveDate: '2026-10-11', itemCount: rows.length, dbPath: 'mock' };
+    return {
+      rows,
+      skippedRows: 0,
+      snapshotDate: '2026-10-12',
+      liveDate: '2026-10-11',
+      itemCount: rows.length,
+      dbPath: 'mock',
+      strategy: mockStrategy(),
+    };
   },
   async itemHistory(itemId) {
     await sleep(120);

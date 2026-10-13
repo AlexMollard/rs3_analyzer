@@ -12,6 +12,7 @@ A desktop application for analyzing RuneScape 3 Grand Exchange market data to id
 - **Trading Desk**: Sortable, virtualized flip table with a detail panel (interactive price chart, buy/sell/tax/trend, risk notes, copy-to-clipboard summary)
 - **Live margins**: Real-time instant-buy and instant-sell averages from the RuneScape Wiki for each item, and an expected profit per day from the item's recent record at those prices, shown next to the guide-price scoring (which stays the default ranking; see [docs/backtest.md](docs/backtest.md))
 - **Watchlist**: Favourites shown as cards with sparklines and total profit at your budget
+- **Hourly Strategy**: A separate tab with the day's top 10 picks of a pre-registered hourly flip strategy: buy and sell targets at your budget, the schedule in UTC and your local time, its held-out backtest results and the risks. It passed its held-out test (86% of trades profitable, about 0.94M gp a day at 50M over 19 days), but that is a short sample with estimated fills, and the Score ranking stays the default (see [docs/strategy.md](docs/strategy.md))
 - **Customizable Filters**: Filter by tier, minimum profit, ROI, daily volume, budget, and search terms
 - **Neutral stone UI**: Dark RuneScape-inspired theme, bundled fonts, keyboard navigation
 
@@ -26,7 +27,7 @@ The app is built with [Tauri 2](https://v2.tauri.app/): a Svelte 5 + TypeScript 
 
 ### Project layout
 
-- `src-tauri/` - Rust: Tauri commands (`lib.rs`, `commands.rs`), favourites store (`favorites.rs`), the analysis core (`loader.rs`, `stats.rs`, `flips.rs`, `model.rs`, `trade.rs`) and the backtest (`backtest.rs`, `bin/backtest.rs`)
+- `src-tauri/` - Rust: Tauri commands (`lib.rs`, `commands.rs`), favourites store (`favorites.rs`), the analysis core (`loader.rs`, `stats.rs`, `flips.rs`, `model.rs`, `trade.rs`, and the hourly strategy rules in `hourly.rs`) and the backtests (`backtest.rs`, `bin/backtest.rs`)
 - `ui/` - Svelte frontend (`App.svelte`, `components/`, `lib/`)
 - `index.html`, `vite.config.ts`, `package.json` - frontend build
 
@@ -71,8 +72,11 @@ cargo clippy --all-targets --all-features -- -D warnings   # also lints the back
 ```bash
 cd src-tauri
 cargo run --release --features backtest --bin backtest -- --help
-cargo run --release --features backtest --bin backtest     # prints the markdown report
+cargo run --release --features backtest --bin backtest -- --db ../rs3_market.db     # prints the markdown report
+cargo run --release --features backtest --bin backtest -- --db ../rs3_market.db --hourly   # hourly strategy study
 ```
+
+`docs/strategy.md` describes the hourly strategy search on `rt_hourly` and how to re-run it (its plan, fixed before it was run, is `docs/strategy-plan.md`). Release builds look for the database only in the current directory and next to the executable, hence `--db` when running from `src-tauri`.
 
 ## Database
 
@@ -107,10 +111,23 @@ CREATE TABLE rt_daily (           -- real-time trades, one row per item per UTC 
     PRIMARY KEY (item_id, record_date)
 );
 
+CREATE TABLE rt_hourly (          -- real-time trades, one row per item per hour it traded
+    item_id INTEGER,
+    ts INTEGER,               -- hour start, unix seconds UTC
+    avg_high REAL,            -- average instant-buy price, NULL if none that hour
+    avg_low REAL,             -- average instant-sell price, NULL if none that hour
+    high_volume INTEGER,
+    low_volume INTEGER,
+    PRIMARY KEY (item_id, ts)
+) WITHOUT ROWID;              -- clustered by item, about 40% smaller than a rowid table
+
 CREATE INDEX idx_history_record_date ON history(record_date);
 CREATE INDEX idx_items_name ON items(name);
 CREATE INDEX idx_rt_daily_record_date ON rt_daily(record_date);
+CREATE INDEX idx_rt_hourly_ts ON rt_hourly(ts);
 ```
+
+`rt_daily` is folded from `rt_hourly`: each side's price is the volume-weighted average of its hours.
 
 ### Building the database with the Python tooling
 
@@ -118,8 +135,8 @@ CREATE INDEX idx_rt_daily_record_date ON rt_daily(record_date);
 pip install -r requirements.txt
 ```
 
-- `rs3_collector.py` - downloads today's Grand Exchange snapshot and stores one row per item for today's UTC date. Run it daily (for example from Task Scheduler). If the snapshot is unavailable it falls back to the batched latest-price API for items already in the database. It creates `rs3_market.db` if missing, retries transient failures with backoff, appends to `collector_log.txt`, and exits non-zero on failure. It then adds yesterday's real-time day to `rt_daily` (24 bulk hourly requests to the RuneScape Wiki real-time API, catching up at most 7 missing days); a real-time failure is logged as a warning and does not fail the run.
-- `backfill_rt.py` - fills `rt_daily` from the first complete day of real-time data (2026-07-24) to yesterday, one bulk `/1h` request per hour of each day at one request per second. Each day is written only once all 24 hours are fetched, so it is safe to stop and re-run; completed days are skipped.
+- `rs3_collector.py` - downloads today's Grand Exchange snapshot and stores one row per item for today's UTC date. Run it daily (for example from Task Scheduler). If the snapshot is unavailable it falls back to the batched latest-price API for items already in the database. It creates `rs3_market.db` if missing, retries transient failures with backoff, appends to `collector_log.txt`, and exits non-zero on failure. It then stores the real-time hours it is missing in `rt_hourly`: one bulk `/1h` request to the RuneScape Wiki real-time API per hour, for at most the last 7 days plus today, up to the last hour that closed at least an hour ago. Each missing day whose 24 hours are all stored is then folded into `rt_daily`. A real-time failure is logged as a warning and does not fail the run.
+- `backfill_rt.py` - fills `rt_hourly` from the first hour of real-time data (2026-07-23 17:00 UTC) to the last settled hour, one bulk `/1h` request per hour with at least a second between requests (about 2,000 requests from scratch, roughly an hour). Each hour is written in one transaction and stored hours are skipped, so it is safe to stop and re-run. It then folds every missing complete day (from 2026-07-24) into `rt_daily`, and lists any hour or day that failed.
 - `backfill_history.py` - fetches price history for every item already in the `items` table and inserts the missing days, keeping only the last 365 days (`HISTORY_DAYS`), the longest window the app uses. Run `rs3_collector.py` once first so `items` is populated, then run the backfill. `python backfill_history.py --prune` deletes rows older than that window from an existing database and compacts it (keep a copy first if you want the old history). Requests are rate limited (shared across workers), transient errors are retried, and any item ids that still fail are printed with a non-zero exit code. It is safe to re-run.
 
 The scripts resolve `rs3_market.db` and `collector_log.txt` relative to the script directory, not the current directory. Daily guide prices come from the Weird Gloop Grand Exchange APIs; real-time prices come from the [RuneScape Wiki real-time API](https://runescape.wiki/w/RuneScape:Real-time_Prices) (prices.runescape.wiki), which asks for a descriptive User-Agent and bulk requests instead of one per item.
@@ -146,6 +163,7 @@ Both write to a temporary file and only replace the target when the operation su
 6. **Check Live Prices**: The Live margin and Exp/day columns and tiles use the last 3 days of real-time trades, and are filled in while the newest real-time day in the database is at most 3 days old. Exp/day is the item's recent record at live prices times the live quantity at your budget (also capped at 10% of the live daily volume); the backtest found it overstates profit, so treat it as a comparison between items rather than a forecast
 7. **Mark Favourites**: Click a star. Favourites appear on the Watchlist tab and are stored in `favorites.json` in the app's config directory (`%APPDATA%\com.alexmollard.rs3analyzer` on Windows). A `favorites.json` from an older build in the current or executable directory is imported on first run
 8. **Copy Details**: Click "Copy flip summary" in the detail panel
+9. **Try the Hourly Strategy**: The Strategy tab lists the day's top 10 picks at your budget (each gets a tenth of it) with Buy at and Sell at prices, the day's schedule in UTC and your local time, the held-out backtest results and the risks. A day's targets need the real-time hours through 23:00 UTC the day before, which the collector stores from 01:00 UTC; hourly data more than 3 days old shows no picks
 
 ## Filtering Logic
 

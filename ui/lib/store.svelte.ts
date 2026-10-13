@@ -1,11 +1,11 @@
 // App state (Svelte 5 runes). Components read and write `app` directly.
 import { backend, errorText } from './api.ts';
-import { DEFAULT_BUDGET, DEFAULT_FILTERS, DEFAULT_SORT, filterRows, priceRow, sortRows } from './flips.ts';
-import type { Filters, Sort } from './flips.ts';
+import { DEFAULT_BUDGET, DEFAULT_FILTERS, DEFAULT_SORT, filterRows, priceRow, sortRows, strategyPicks } from './flips.ts';
+import type { Filters, Sort, StrategyPick } from './flips.ts';
 import { formatInt } from './format.ts';
 import type { PricedRow, ScanError, ScanResult } from './types.ts';
 
-export type Tab = 'desk' | 'watch';
+export type Tab = 'desk' | 'watch' | 'strategy';
 export type StatusKind = 'ok' | 'busy' | 'error' | 'info';
 
 class AppState {
@@ -33,6 +33,8 @@ class AppState {
   visible: PricedRow[] = $derived(sortRows(filterRows(this.priced, this.filters, this.search, this.favorites), this.sort));
   // Looked up in all rows, so the panel stays open when the item is filtered out
   selected: PricedRow | null = $derived(this.priced.find((r) => r.itemId === this.selectedId) ?? null);
+  // The hourly strategy's day at the current budget; independent of the desk's filters and sort
+  picks: StrategyPick[] = $derived(this.result ? strategyPicks(this.result.rows, this.budget, this.result.strategy.picks) : []);
 
   async init() {
     try {
